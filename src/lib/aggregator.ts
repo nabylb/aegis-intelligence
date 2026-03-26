@@ -148,10 +148,20 @@ function calculateStrategicImpact(text: string): number {
 }
 
 // ─── RSS AGGREGATOR ───────────────────────────────────────────────────────────
+let cachedRSSEvents: IntelEvent[] = [];
+let lastRSSFetch: number = 0;
+const RSS_CACHE_TTL = 3 * 60 * 1000; // 3-minute cache
+
 export async function fetchRSSFeeds(): Promise<IntelEvent[]> {
+  if (Date.now() - lastRSSFetch < RSS_CACHE_TTL && cachedRSSEvents.length > 0) {
+    return cachedRSSEvents;
+  }
+
   const events: IntelEvent[] = [];
-  for (const feed of RSS_FEEDS) {
-    try {
+
+  const feedResults = await Promise.allSettled(
+    RSS_FEEDS.map(async (feed) => {
+      const feedEvents: IntelEvent[] = [];
       const parsed = await parser.parseURL(feed.url);
       const recentItems = parsed.items.slice(0, 5); // 5 latest from each feed
       for (const item of recentItems) {
@@ -194,7 +204,7 @@ export async function fetchRSSFeeds(): Promise<IntelEvent[]> {
           const navalMeta = classifyNavalEvent(searchString);
           const heroImage = extractRSSImage(item);
 
-          events.push({
+          feedEvents.push({
             id: safeId,
             timestamp: item.isoDate || new Date().toISOString(),
             title: item.title,
@@ -209,11 +219,17 @@ export async function fetchRSSFeeds(): Promise<IntelEvent[]> {
             entity: navalMeta ? { isMilitary: navalMeta.isMilitary } : undefined
           });
       }
-    } catch (err) {
-      console.error(`RSS ${feed.name} failed:`, err);
-    }
+      return feedEvents;
+    })
+  );
+
+  for (const result of feedResults) {
+    if (result.status === 'fulfilled') events.push(...result.value);
   }
-  return events.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+  cachedRSSEvents = events.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+  lastRSSFetch = Date.now();
+  return cachedRSSEvents;
 }
 
 // ─── BACKGROUND CRON WEB SCRAPER: Think Tanks & Analysis (CSIS, INSS, ISW) ────
@@ -302,14 +318,22 @@ async function getACLEDToken(email: string, pass: string): Promise<string | null
   }
 }
 
+let cachedACLEDEvents: IntelEvent[] = [];
+let lastACLEDFetch: number = 0;
+const ACLED_CACHE_TTL = 10 * 60 * 1000; // 10-minute cache
+
 export async function fetchACLEDData(): Promise<IntelEvent[]> {
   const events: IntelEvent[] = [];
   const ACLED_EMAIL = process.env.ACLED_EMAIL || '';
   const ACLED_PASSWORD = process.env.ACLED_PASSWORD || '';
-  
+
   if (!ACLED_EMAIL || !ACLED_PASSWORD) {
     console.warn('[ACLED] No credentials configured - skipping. Set ACLED_EMAIL and ACLED_PASSWORD.');
     return [];
+  }
+
+  if (Date.now() - lastACLEDFetch < ACLED_CACHE_TTL && cachedACLEDEvents.length > 0) {
+    return cachedACLEDEvents;
   }
 
   const token = await getACLEDToken(ACLED_EMAIL, ACLED_PASSWORD);
@@ -337,10 +361,10 @@ export async function fetchACLEDData(): Promise<IntelEvent[]> {
       console.error('[ACLED] Network fetch failed:', err.message);
       return null;
     });
-    
-    if (!resp || !resp.ok) return [];
+
+    if (!resp || !resp.ok) return cachedACLEDEvents;
     const data = await resp.json().catch(() => null);
-    if (!data || !data.data) return [];
+    if (!data || !data.data) return cachedACLEDEvents;
 
     data.data.forEach((e: any) => {
       const score = calculateStrategicImpact(`${e.notes} ${e.actor1} ${e.actor2}`);
@@ -376,11 +400,14 @@ export async function fetchACLEDData(): Promise<IntelEvent[]> {
     });
   } catch (err) {
     console.error('[ACLED] Fetch failed:', err);
+    return cachedACLEDEvents;
   }
 
-  // Removed ACLED Hardcoded Fallback per user request. 
+  // Removed ACLED Hardcoded Fallback per user request.
   // We now rely entirely on the GDELT NLP Casualty Engine for un-gated real-time metrics.
-  return events;
+  cachedACLEDEvents = events;
+  lastACLEDFetch = Date.now();
+  return cachedACLEDEvents;
 }
 
 // ─── GDELT (GLOBAL DATABASE OF EVENTS) ──────────────────────────────────────────
@@ -581,11 +608,16 @@ async function fetchAndParseGDELTExport(url: string): Promise<IntelEvent[]> {
   const csvText = await decompressGDELTZip(zipBuffer);
   if (!csvText) return [];
 
-  return parseGDELTExportCSV(csvText);
+  // Extract the timestamp from the URL (e.g. "20260325231500" from the filename)
+  const tsMatch = url.match(/(\d{14})\.export/);
+  const exportTimestamp = tsMatch ? tsMatch[1] : undefined;
+
+  return parseGDELTExportCSV(csvText, exportTimestamp);
 }
 
 // Parse GDELT export CSV text into IntelEvents
-function parseGDELTExportCSV(csvText: string): IntelEvent[] {
+// exportTimestamp is the 15-minute window timestamp from the filename (e.g. "20260325231500")
+function parseGDELTExportCSV(csvText: string, exportTimestamp?: string): IntelEvent[] {
   const events: IntelEvent[] = [];
 
     // Parse tab-delimited CSV rows
@@ -605,8 +637,13 @@ function parseGDELTExportCSV(csvText: string): IntelEvent[] {
       if (cols.length < 61) continue;
 
       const eventCode = cols[26] || '';
-      // Filter: CAMEO 18x=Assault, 19x=Fight/Military, 20x=Mass Violence
-      if (!eventCode.match(/^(18|19|20)/)) continue;
+      // Filter: Only actual kinetic/military strike codes
+      // 183=Armed attack, 184=Assassination, 185=Chem/bio, 186=Suicide bomb
+      // 190=Military force, 193=Small arms, 194=Artillery/missiles, 195=Aerial weapons
+      // 196=Ceasefire violation, 200+=Mass violence
+      // Exclude: 180(generic), 181(abduction), 182(assault), 191(blockade), 192(occupy)
+      const KINETIC_CODES = ['183','184','185','186','190','193','194','195','196','200','201','202','203'];
+      if (!KINETIC_CODES.includes(eventCode)) continue;
 
       const lat = parseFloat(cols[56]);
       const lng = parseFloat(cols[57]);
@@ -638,9 +675,14 @@ function parseGDELTExportCSV(csvText: string): IntelEvent[] {
       // CAMEO code descriptions
       const cameoLabel = getCameoLabel(eventCode);
 
-      // Parse date
+      // Parse date — use the export file's 15-min timestamp for precise timing
+      // Format: "20260325231500" → 2026-03-25T23:15:00Z
       let timestamp = new Date().toISOString();
-      if (dateStr.length === 8) {
+      if (exportTimestamp && exportTimestamp.length >= 14) {
+        const ts = exportTimestamp;
+        const d = new Date(`${ts.slice(0,4)}-${ts.slice(4,6)}-${ts.slice(6,8)}T${ts.slice(8,10)}:${ts.slice(10,12)}:${ts.slice(12,14)}Z`);
+        if (!isNaN(d.getTime())) timestamp = d.toISOString();
+      } else if (dateStr.length === 8) {
         const d = new Date(`${dateStr.slice(0,4)}-${dateStr.slice(4,6)}-${dateStr.slice(6,8)}T12:00:00Z`);
         if (!isNaN(d.getTime())) timestamp = d.toISOString();
       }
@@ -721,9 +763,17 @@ function getCameoLabel(code: string): string {
 
 // ─── X (TWITTER) OSINT BRIDGE ────────────────────────────────────────────────
 // Fetches social intelligence via Nitter RSS clusters
+let cachedOSINTEvents: IntelEvent[] = [];
+let lastOSINTFetch: number = 0;
+const OSINT_CACHE_TTL = 3 * 60 * 1000; // 3-minute cache
+
 export async function fetchOSINTFeeds(): Promise<IntelEvent[]> {
+  if (Date.now() - lastOSINTFetch < OSINT_CACHE_TTL && cachedOSINTEvents.length > 0) {
+    return cachedOSINTEvents;
+  }
+
   const allEvents: IntelEvent[] = [];
-  
+
   for (const handle of OSINT_HANDLES) {
     // Try multiple nitter instances if one is down
     let data: any = null;
@@ -769,6 +819,11 @@ export async function fetchOSINTFeeds(): Promise<IntelEvent[]> {
         ...(location && { location })
       });
     });
+  }
+
+  if (allEvents.length > 0) {
+    cachedOSINTEvents = allEvents;
+    lastOSINTFetch = Date.now();
   }
 
   return allEvents;
@@ -871,7 +926,15 @@ export async function fetchXFeeds(): Promise<IntelEvent[]> {
 
 // ─── AVIATION (FlightRadar24) ──────────────────────────────────────────────────
 // Unthrottled FlightRadar24 data feed for Middle East bounding box
+let cachedOpenSkyEvents: IntelEvent[] = [];
+let lastOpenSkyFetch: number = 0;
+const OPENSKY_CACHE_TTL = 30 * 1000; // 30-second cache
+
 export async function fetchOpenSkyData(): Promise<IntelEvent[]> {
+  if (Date.now() - lastOpenSkyFetch < OPENSKY_CACHE_TTL && cachedOpenSkyEvents.length > 0) {
+    return cachedOpenSkyEvents;
+  }
+
   const events: IntelEvent[] = [];
   try {
     // Top-left to bottom-right bounding box precisely centered on Iran, Persian Gulf, and Levant
@@ -890,9 +953,9 @@ export async function fetchOpenSkyData(): Promise<IntelEvent[]> {
       return null;
     });
     
-    if (!response || !response.ok) return [];
+    if (!response || !response.ok) return cachedOpenSkyEvents;
     const data = await response.json().catch(() => null);
-    if (!data) return [];
+    if (!data) return cachedOpenSkyEvents;
 
     let count = 0;
     // FR24 JSON keys are flight IDs, values are arrays of flight data
@@ -904,31 +967,53 @@ export async function fetchOpenSkyData(): Promise<IntelEvent[]> {
 
     for (const [key, flight] of sampledFlights) {
       const f = flight as any[];
+      // FR24 array indices:
+      //  0: ICAO24 Hex, 1: Lat, 2: Lng, 3: Heading, 4: Altitude(ft), 5: Speed(kts)
+      //  8: Aircraft Type (B789, A20N, etc), 9: Registration (4X-EDD)
+      // 11: Origin IATA, 12: Dest IATA, 13: Flight Number (LY834)
+      // 16: Callsign (ELY834), 18: Airline ICAO Code (ELY)
+      const callsign = f[16] || f[13] || '';
+      const flightNum = f[13] || '';
+      const registration = f[9] || '';
+      const aircraftType = f[8] || '';
+      const airline = f[18] || '';
+      const origin = f[11] || '';
+      const destination = f[12] || '';
+
       events.push({
         id: `flight-${key}`,
         timestamp: new Date().toISOString(),
-        title: `Flight ${f[16] || f[1]}`, // Flight name or callsign
+        title: `${callsign || 'Unknown'} ${origin && destination ? `(${origin}→${destination})` : ''}`.trim(),
+        summary: [
+          aircraftType && `Type: ${aircraftType}`,
+          registration && `Reg: ${registration}`,
+          airline && `Airline: ${airline}`,
+          flightNum && `Flight: ${flightNum}`,
+        ].filter(Boolean).join(' | '),
         source: 'Aviation Transponder',
         type: 'aviation',
         severity: 'low',
-        location: { lat: f[1], lng: f[2] }, // lat, lon
+        location: { lat: f[1], lng: f[2] },
         entity: {
-          callsign: f[16] || f[1] || 'UNKNOWN',
-          icao24: f[0], // FR24 index 0 is the ICAO Hex
-          type: f[8],   // FR24 index 8 is the aircraft type (e.g. F16, B738)
+          callsign,
+          icao24: f[0],
+          type: aircraftType,
           heading: f[3],
           altitude: f[4],
           speed: f[5],
-          country: f[8], // Radar hint
-          origin: f[11] || 'UNK',
-          destination: f[12] || 'UNK'
+          country: registration, // Registration prefix indicates country
+          origin,
+          destination,
         }
       });
     }
   } catch (err) {
     console.error('[FR24 Aviation] Processing failed:', err);
+    return cachedOpenSkyEvents;
   }
-  return events;
+  cachedOpenSkyEvents = events;
+  lastOpenSkyFetch = Date.now();
+  return cachedOpenSkyEvents;
 }
 
 // ─── GLOBAL AIS (Open Source Snapshot) ─────────────────────────────────────────
@@ -1104,7 +1189,15 @@ export async function fetchTzevaAdomAlerts(): Promise<IntelEvent[]> {
 
 // ─── GLOBAL AEGIS SATELLITE OSINT ──────────────────────────────────────────────
 // Simulated/Synthetic high-resolution tactical satellite imagery feed.
+let cachedSatelliteEvents: IntelEvent[] = [];
+let lastSatelliteFetch: number = 0;
+const SATELLITE_CACHE_TTL = 5 * 60 * 1000; // 5-minute cache
+
 export async function fetchSatelliteOSINT(): Promise<IntelEvent[]> {
+  if (Date.now() - lastSatelliteFetch < SATELLITE_CACHE_TTL && cachedSatelliteEvents.length > 0) {
+    return cachedSatelliteEvents;
+  }
+
   const events: IntelEvent[] = [
     {
       id: `sat-natanz-${new Date().getUTCHours()}`,
@@ -1143,5 +1236,789 @@ export async function fetchSatelliteOSINT(): Promise<IntelEvent[]> {
       strategicScore: -2
     }
   ];
-  return events;
+
+  cachedSatelliteEvents = events;
+  lastSatelliteFetch = Date.now();
+  return cachedSatelliteEvents;
+}
+
+// ─── NASA FIRMS (Fire Information for Resource Management System) ────────────
+// Near real-time thermal anomaly detection from VIIRS/MODIS satellites.
+// Detects active fires, airstrikes, oil burns, explosions, industrial activity.
+// Uses the open CSV API — no auth required for country-level queries.
+
+let cachedFIRMSEvents: IntelEvent[] = [];
+let lastFIRMSFetch: number = 0;
+const FIRMS_CACHE_TTL = 5 * 60 * 1000; // 5-minute cache
+
+// Countries to monitor with their ISO3 codes
+const FIRMS_COUNTRIES = [
+  { code: 'SYR', name: 'Syria' },
+  { code: 'IRQ', name: 'Iraq' },
+  { code: 'YEM', name: 'Yemen' },
+  { code: 'LBN', name: 'Lebanon' },
+  { code: 'ISR', name: 'Israel' },
+  { code: 'IRN', name: 'Iran' },
+  { code: 'PSE', name: 'Palestine' },
+];
+
+export async function fetchNASAFIRMS(): Promise<IntelEvent[]> {
+  if (Date.now() - lastFIRMSFetch < FIRMS_CACHE_TTL && cachedFIRMSEvents.length > 0) {
+    return cachedFIRMSEvents;
+  }
+
+  const events: IntelEvent[] = [];
+
+  try {
+    // Use the open FIRMS CSV endpoint (no MAP_KEY needed for country-level)
+    // VIIRS_SNPP_NRT = near real-time VIIRS data, last 24 hours
+    for (const country of FIRMS_COUNTRIES) {
+      try {
+        const url = `https://firms.modaps.eosdis.nasa.gov/api/country/csv/VIIRS_SNPP_NRT/${country.code}/1`;
+        const res = await fetch(url, {
+          signal: AbortSignal.timeout(8000),
+          headers: { 'User-Agent': 'Aegis-OSINT/1.0' }
+        }).catch(() => null);
+
+        if (!res || !res.ok) continue;
+        const csv = await res.text();
+        const lines = csv.split('\n');
+        if (lines.length < 2) continue;
+
+        // Parse CSV header to get column indices
+        const headers = lines[0].split(',');
+        const latIdx = headers.indexOf('latitude');
+        const lngIdx = headers.indexOf('longitude');
+        const brightIdx = headers.indexOf('bright_ti4');
+        const frpIdx = headers.indexOf('frp');
+        const dateIdx = headers.indexOf('acq_date');
+        const timeIdx = headers.indexOf('acq_time');
+        const confIdx = headers.indexOf('confidence');
+        const dayNightIdx = headers.indexOf('daynight');
+
+        // Process rows — sample to max 50 per country to prevent overload
+        const dataLines = lines.slice(1).filter(l => l.trim());
+        const sampled = dataLines.length > 50
+          ? dataLines.sort(() => 0.5 - Math.random()).slice(0, 50)
+          : dataLines;
+
+        for (const line of sampled) {
+          const cols = line.split(',');
+          const lat = parseFloat(cols[latIdx]);
+          const lng = parseFloat(cols[lngIdx]);
+          if (isNaN(lat) || isNaN(lng)) continue;
+
+          const brightness = parseFloat(cols[brightIdx]) || 0;
+          const frp = parseFloat(cols[frpIdx]) || 0; // Fire Radiative Power in MW
+          const confidence = cols[confIdx] || 'nominal';
+          const dayNight = cols[dayNightIdx] || '';
+          const acqDate = cols[dateIdx] || '';
+          const acqTime = cols[timeIdx] || '';
+
+          // Build timestamp
+          let timestamp = new Date().toISOString();
+          if (acqDate && acqTime) {
+            const t = acqTime.padStart(4, '0');
+            const d = new Date(`${acqDate}T${t.slice(0, 2)}:${t.slice(2, 4)}:00Z`);
+            if (!isNaN(d.getTime())) timestamp = d.toISOString();
+          }
+
+          // Severity based on Fire Radiative Power (MW)
+          let severity: IntelSeverity = 'low';
+          if (frp > 100 || brightness > 400) severity = 'critical';
+          else if (frp > 50 || brightness > 370) severity = 'high';
+          else if (frp > 10 || brightness > 340) severity = 'medium';
+
+          // Determine likely type from FRP and context
+          const isHighIntensity = frp > 30 || brightness > 360;
+          const typeLabel = isHighIntensity
+            ? 'High-Intensity Thermal Anomaly'
+            : 'Thermal Anomaly Detected';
+
+          events.push({
+            id: `firms-${country.code}-${lat.toFixed(3)}-${lng.toFixed(3)}-${acqDate}-${acqTime}`,
+            timestamp,
+            title: `${typeLabel}: ${country.name} (${lat.toFixed(2)}°N, ${lng.toFixed(2)}°E)`,
+            summary: `NASA VIIRS satellite detected thermal anomaly. Brightness: ${brightness.toFixed(1)}K | FRP: ${frp.toFixed(1)} MW | Confidence: ${confidence} | ${dayNight === 'D' ? 'Daytime' : 'Nighttime'} pass`,
+            source: 'NASA FIRMS Satellite',
+            type: 'thermal',
+            severity,
+            location: { lat, lng, name: `${country.name} (${lat.toFixed(2)}°N, ${lng.toFixed(2)}°E)` },
+            strategicScore: isHighIntensity ? 1 : 0,
+          });
+        }
+      } catch (err) {
+        console.error(`[FIRMS] ${country.name} fetch failed:`, err);
+      }
+    }
+
+    if (events.length > 0) {
+      cachedFIRMSEvents = events;
+      lastFIRMSFetch = Date.now();
+    }
+  } catch (err) {
+    console.error('[FIRMS] Global fetch failed:', err);
+  }
+
+  return cachedFIRMSEvents.length > 0 ? cachedFIRMSEvents : events;
+}
+
+// ─── USGS EARTHQUAKE API ────────────────────────────────────────────────────
+// Real-time seismic data — detects earthquakes near nuclear facilities,
+// potential underground tests, and natural seismic activity.
+// Fully open GeoJSON API, no auth required.
+
+let cachedEarthquakeEvents: IntelEvent[] = [];
+let lastEarthquakeFetch: number = 0;
+const EARTHQUAKE_CACHE_TTL = 10 * 60 * 1000; // 10-minute cache
+
+// Nuclear facilities to monitor proximity
+const NUCLEAR_FACILITIES = [
+  { name: 'Natanz Enrichment', lat: 33.7258, lng: 51.7289 },
+  { name: 'Fordow Enrichment', lat: 34.8841, lng: 50.9959 },
+  { name: 'Isfahan Nuclear', lat: 32.6539, lng: 51.6660 },
+  { name: 'Bushehr NPP', lat: 28.8310, lng: 50.8840 },
+  { name: 'Arak Heavy Water', lat: 34.3667, lng: 49.2500 },
+  { name: 'Dimona Nuclear', lat: 31.0683, lng: 35.0326 },
+  { name: 'Parchin Complex', lat: 35.5200, lng: 51.7700 },
+];
+
+function getNearbyNuclearFacility(lat: number, lng: number, radiusKm: number = 100): string | null {
+  for (const facility of NUCLEAR_FACILITIES) {
+    const dLat = (facility.lat - lat) * 111;
+    const dLng = (facility.lng - lng) * 111 * Math.cos(lat * Math.PI / 180);
+    const dist = Math.sqrt(dLat * dLat + dLng * dLng);
+    if (dist < radiusKm) return `${facility.name} (${dist.toFixed(0)}km)`;
+  }
+  return null;
+}
+
+export async function fetchUSGSEarthquakes(): Promise<IntelEvent[]> {
+  if (Date.now() - lastEarthquakeFetch < EARTHQUAKE_CACHE_TTL && cachedEarthquakeEvents.length > 0) {
+    return cachedEarthquakeEvents;
+  }
+
+  const events: IntelEvent[] = [];
+
+  try {
+    // Query Middle East bounding box, minimum magnitude 2.0, last 7 days
+    const url = 'https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&minlatitude=12&maxlatitude=42&minlongitude=25&maxlongitude=65&minmagnitude=2.0&orderby=time&limit=100';
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(10000),
+      headers: { 'Accept': 'application/json' }
+    }).catch(() => null);
+
+    if (!res || !res.ok) return cachedEarthquakeEvents;
+    const data = await res.json().catch(() => null);
+    if (!data?.features) return cachedEarthquakeEvents;
+
+    for (const feature of data.features) {
+      const props = feature.properties;
+      const coords = feature.geometry?.coordinates;
+      if (!coords || coords.length < 3) continue;
+
+      const lng = coords[0];
+      const lat = coords[1];
+      const depth = coords[2]; // km
+      const mag = props.mag || 0;
+      const place = props.place || `${lat.toFixed(2)}°N, ${lng.toFixed(2)}°E`;
+      const time = props.time ? new Date(props.time).toISOString() : new Date().toISOString();
+      const tsunami = props.tsunami;
+      const nearFacility = getNearbyNuclearFacility(lat, lng);
+
+      // Severity based on magnitude and proximity to nuclear facilities
+      let severity: IntelSeverity = 'low';
+      if (mag >= 6.0 || (nearFacility && mag >= 4.0)) severity = 'critical';
+      else if (mag >= 5.0 || (nearFacility && mag >= 3.0)) severity = 'high';
+      else if (mag >= 4.0) severity = 'medium';
+
+      // Shallow earthquakes (<10km) near facilities are more concerning
+      const isShallow = depth < 10;
+      const facilityWarning = nearFacility ? ` | NEAR: ${nearFacility}` : '';
+      const shallowFlag = isShallow && nearFacility ? ' | SHALLOW DEPTH — MONITOR' : '';
+
+      events.push({
+        id: `usgs-${props.ids || feature.id || `${lat}-${lng}-${props.time}`}`,
+        timestamp: time,
+        title: `M${mag.toFixed(1)} Earthquake: ${place}`,
+        summary: `Magnitude ${mag.toFixed(1)} at ${depth.toFixed(1)}km depth${facilityWarning}${shallowFlag}${tsunami ? ' | TSUNAMI WARNING' : ''} | ${props.type || 'earthquake'}`,
+        source: 'USGS Seismic Network',
+        sourceUrl: props.url || undefined,
+        type: 'seismic',
+        severity,
+        location: { lat, lng, name: place },
+        strategicScore: nearFacility ? 2 : 0,
+      });
+    }
+
+    if (events.length > 0) {
+      cachedEarthquakeEvents = events;
+      lastEarthquakeFetch = Date.now();
+    }
+  } catch (err) {
+    console.error('[USGS] Earthquake fetch failed:', err);
+  }
+
+  return cachedEarthquakeEvents.length > 0 ? cachedEarthquakeEvents : events;
+}
+
+// ─── OPEN-METEO WEATHER API ─────────────────────────────────────────────────
+// Military-relevant weather data: dust storms, visibility, wind for key locations.
+// Fully open, no auth required. 10,000 requests/day.
+
+let cachedWeatherEvents: IntelEvent[] = [];
+let lastWeatherFetch: number = 0;
+const WEATHER_CACHE_TTL = 30 * 60 * 1000; // 30-minute cache
+
+const WEATHER_LOCATIONS = [
+  { name: 'Tehran, Iran', lat: 35.69, lng: 51.39, country: 'ir' },
+  { name: 'Baghdad, Iraq', lat: 33.32, lng: 44.37, country: 'iq' },
+  { name: 'Damascus, Syria', lat: 33.51, lng: 36.28, country: 'sy' },
+  { name: 'Riyadh, Saudi Arabia', lat: 24.69, lng: 46.72, country: 'sa' },
+  { name: 'Tel Aviv, Israel', lat: 32.09, lng: 34.78, country: 'il' },
+  { name: 'Sanaa, Yemen', lat: 15.37, lng: 44.19, country: 'ye' },
+  { name: 'Beirut, Lebanon', lat: 33.89, lng: 35.50, country: 'lb' },
+  { name: 'Strait of Hormuz', lat: 26.57, lng: 56.25, country: 'om' },
+  { name: 'Red Sea (Bab el-Mandeb)', lat: 12.58, lng: 43.33, country: 'dj' },
+  { name: 'Natanz, Iran', lat: 33.73, lng: 51.73, country: 'ir' },
+];
+
+export async function fetchWeatherData(): Promise<IntelEvent[]> {
+  if (Date.now() - lastWeatherFetch < WEATHER_CACHE_TTL && cachedWeatherEvents.length > 0) {
+    return cachedWeatherEvents;
+  }
+
+  const events: IntelEvent[] = [];
+
+  try {
+    // Batch all locations into parallel fetches
+    const fetches = WEATHER_LOCATIONS.map(async (loc) => {
+      try {
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lng}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_gusts_10m,wind_direction_10m,visibility,dust,weather_code&daily=uv_index_max&forecast_days=1&timezone=auto`;
+        const res = await fetch(url, { signal: AbortSignal.timeout(6000) }).catch(() => null);
+        if (!res || !res.ok) return;
+
+        const data = await res.json().catch(() => null);
+        if (!data?.current) return;
+
+        const c = data.current;
+        const temp = c.temperature_2m;
+        const wind = c.wind_speed_10m;
+        const gusts = c.wind_gusts_10m;
+        const windDir = c.wind_direction_10m;
+        const visibility = c.visibility; // meters
+        const dust = c.dust; // µg/m³ (PM10 dust)
+        const humidity = c.relative_humidity_2m;
+        const weatherCode = c.weather_code;
+        const uvIndex = data.daily?.uv_index_max?.[0];
+
+        // Determine if conditions are operationally significant
+        const visKm = (visibility || 10000) / 1000;
+        const isDustStorm = (dust && dust > 150) || visKm < 2;
+        const isHighWind = wind > 50 || gusts > 80;
+        const isExtremeHeat = temp > 45;
+        const isSevereWeather = weatherCode >= 95; // Thunderstorm/severe
+
+        // Only report operationally significant weather
+        if (!isDustStorm && !isHighWind && !isExtremeHeat && !isSevereWeather && visKm > 5) return;
+
+        let severity: IntelSeverity = 'low';
+        let conditionLabel = 'Weather Advisory';
+
+        if (isDustStorm) {
+          conditionLabel = dust > 300 ? 'SEVERE DUST STORM' : 'Dust Storm';
+          severity = dust > 300 || visKm < 1 ? 'critical' : visKm < 3 ? 'high' : 'medium';
+        } else if (isHighWind) {
+          conditionLabel = gusts > 100 ? 'EXTREME WIND' : 'High Wind Advisory';
+          severity = gusts > 100 ? 'critical' : 'high';
+        } else if (isExtremeHeat) {
+          conditionLabel = temp > 50 ? 'EXTREME HEAT WARNING' : 'Heat Advisory';
+          severity = temp > 50 ? 'critical' : 'high';
+        } else if (isSevereWeather) {
+          conditionLabel = 'Severe Weather';
+          severity = 'high';
+        }
+
+        // Wind direction label
+        const dirs = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+        const dirLabel = dirs[Math.round(((windDir || 0) % 360) / 22.5) % 16];
+
+        const flagUrl = `https://flagcdn.com/w40/${loc.country}.png`;
+
+        events.push({
+          id: `weather-${loc.name.replace(/[^a-zA-Z0-9]/g, '')}-${new Date().toISOString().split('T')[0]}`,
+          timestamp: new Date().toISOString(),
+          title: `${conditionLabel}: ${loc.name}`,
+          summary: `Temp: ${temp}°C | Wind: ${wind} km/h ${dirLabel} (gusts ${gusts} km/h) | Visibility: ${visKm.toFixed(1)} km${dust ? ` | Dust: ${dust} µg/m³` : ''} | Humidity: ${humidity}%${uvIndex ? ` | UV: ${uvIndex}` : ''}`,
+          payloadImage: flagUrl,
+          source: 'Open-Meteo Weather',
+          type: 'weather',
+          severity,
+          location: { lat: loc.lat, lng: loc.lng, name: loc.name },
+          strategicScore: 0,
+        });
+      } catch (err) {
+        // Skip individual location failures
+      }
+    });
+
+    await Promise.all(fetches);
+
+    if (events.length > 0) {
+      cachedWeatherEvents = events;
+      lastWeatherFetch = Date.now();
+    }
+  } catch (err) {
+    console.error('[Weather] Fetch failed:', err);
+  }
+
+  return cachedWeatherEvents.length > 0 ? cachedWeatherEvents : events;
+}
+
+// ─── RELIEFWEB API (OCHA Humanitarian Reports) ──────────────────────────────
+// Humanitarian situation reports, crisis updates, and analysis.
+// Fully open REST API, no auth required.
+
+let cachedReliefWebEvents: IntelEvent[] = [];
+let lastReliefWebFetch: number = 0;
+const RELIEFWEB_CACHE_TTL = 15 * 60 * 1000; // 15-minute cache
+
+const RELIEFWEB_COUNTRIES = ['Syria', 'Yemen', 'Iraq', 'Lebanon', 'Iran', 'Palestine'];
+
+export async function fetchReliefWebData(): Promise<IntelEvent[]> {
+  if (Date.now() - lastReliefWebFetch < RELIEFWEB_CACHE_TTL && cachedReliefWebEvents.length > 0) {
+    return cachedReliefWebEvents;
+  }
+
+  const events: IntelEvent[] = [];
+
+  try {
+    // Fetch latest reports using POST for complex filters
+    const url = 'https://api.reliefweb.int/v1/reports?appname=aegis-osint&limit=30&sort[]=date:desc';
+    const body = {
+      filter: {
+        operator: 'OR',
+        conditions: RELIEFWEB_COUNTRIES.map(c => ({
+          field: 'country.name',
+          value: c,
+        })),
+      },
+      fields: {
+        include: ['title', 'body', 'url', 'source', 'date', 'country', 'disaster', 'file', 'headline', 'primary_country'],
+      },
+    };
+
+    const res = await fetch(url, {
+      method: 'POST',
+      signal: AbortSignal.timeout(10000),
+      headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).catch(() => null);
+
+    if (!res || !res.ok) return cachedReliefWebEvents;
+    const data = await res.json().catch(() => null);
+    if (!data?.data) return cachedReliefWebEvents;
+
+    for (const report of data.data) {
+      const fields = report.fields;
+      if (!fields) continue;
+
+      const title = fields.title || 'Humanitarian Report';
+      const rawBody = fields.body || '';
+      const headline = fields.headline?.title || '';
+      const reportUrl = fields.url || '';
+      const date = fields.date?.created ? new Date(fields.date.created).toISOString() : new Date().toISOString();
+      const sources = fields.source?.map((s: any) => s.name).join(', ') || 'ReliefWeb';
+      const countries = fields.country?.map((c: any) => c.name) || [];
+      const primaryCountry = fields.primary_country?.name || countries[0] || '';
+
+      // Extract thumbnail/PDF from file attachments
+      let payloadImage: string | undefined;
+      if (fields.file?.length > 0) {
+        const file = fields.file[0];
+        payloadImage = file.preview?.url || undefined;
+      }
+
+      // Get location from primary country
+      const location = extractLocation(primaryCountry || title);
+
+      // Determine severity from content
+      const searchStr = `${title} ${headline}`.toLowerCase();
+      let severity: IntelSeverity = 'low';
+      if (searchStr.match(/famine|mass casualt|epidemic|cholera|emergency declaration|catastroph/)) severity = 'critical';
+      else if (searchStr.match(/crisis|urgent|displaced|refugee|attack on|hospital|school|civilian/)) severity = 'high';
+      else if (searchStr.match(/humanitarian|aid|relief|access|concern|vulnerab/)) severity = 'medium';
+
+      // Extract first meaningful sentence as summary (strip HTML)
+      const cleanBody = rawBody.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+      const summary = headline || cleanBody.slice(0, 300) + (cleanBody.length > 300 ? '...' : '');
+
+      events.push({
+        id: `reliefweb-${report.id}`,
+        timestamp: date,
+        title,
+        summary,
+        source: `ReliefWeb: ${sources}`,
+        sourceUrl: reportUrl,
+        type: 'humanitarian',
+        severity,
+        ...(payloadImage && { payloadImage }),
+        ...(location && { location }),
+        strategicScore: 0,
+      });
+    }
+
+    if (events.length > 0) {
+      cachedReliefWebEvents = events;
+      lastReliefWebFetch = Date.now();
+    }
+  } catch (err) {
+    console.error('[ReliefWeb] Fetch failed:', err);
+  }
+
+  return cachedReliefWebEvents.length > 0 ? cachedReliefWebEvents : events;
+}
+
+// ============================================================
+// NOTAM Data — Airspace Closures (FAA/ICAO)
+// ============================================================
+
+let cachedNOTAMEvents: IntelEvent[] = [];
+let lastNOTAMFetch: number = 0;
+const NOTAM_CACHE_TTL = 15 * 60 * 1000; // 15-minute cache
+
+export async function fetchNOTAMData(): Promise<IntelEvent[]> {
+  if (Date.now() - lastNOTAMFetch < NOTAM_CACHE_TTL && cachedNOTAMEvents.length > 0) {
+    return cachedNOTAMEvents;
+  }
+
+  const events: IntelEvent[] = [];
+
+  // Use ICAO API via public proxy for Middle East FIRs
+  // Flight Information Regions covering the theater
+  const FIRs = [
+    { code: 'OIIX', name: 'Tehran FIR', lat: 35.69, lng: 51.39 },
+    { code: 'LLLL', name: 'Tel Aviv FIR', lat: 32.01, lng: 34.87 },
+    { code: 'OLBB', name: 'Beirut FIR', lat: 33.82, lng: 35.49 },
+    { code: 'OSTT', name: 'Damascus FIR', lat: 33.41, lng: 36.51 },
+    { code: 'ORBB', name: 'Baghdad FIR', lat: 33.26, lng: 44.23 },
+    { code: 'OYSC', name: 'Sanaa FIR', lat: 15.48, lng: 44.22 },
+    { code: 'OJAC', name: 'Amman FIR', lat: 31.72, lng: 35.99 },
+  ];
+
+  try {
+    // FAA NOTAM API (public, no key required)
+    const results = await Promise.allSettled(
+      FIRs.map(async (fir) => {
+        const url = `https://external-api.faa.gov/notamapi/v1/notams?domesticLocation=${fir.code}&notamType=N&sortBy=effectiveStartDate&sortOrder=Desc&pageSize=10`;
+        const res = await fetch(url, {
+          headers: { 'Accept': 'application/json' },
+          signal: AbortSignal.timeout(8000),
+        }).catch(() => null);
+
+        if (!res || !res.ok) return [];
+        const data = await res.json().catch(() => null);
+        if (!data?.items) return [];
+
+        const firEvents: IntelEvent[] = [];
+        for (const item of data.items.slice(0, 5)) {
+          const text = item.message || item.traditionalMessage || '';
+          const lower = text.toLowerCase();
+
+          // Only interested in military/conflict-relevant NOTAMs
+          const isRelevant = lower.match(/prohibited|restricted|danger area|military|missile|firing|combat|no-fly|closed to civil|temporary restriction/);
+          if (!isRelevant) continue;
+
+          let severity: IntelSeverity = 'medium';
+          if (lower.match(/prohibited|no-fly|closed to civil|combat/)) severity = 'high';
+          if (lower.match(/missile|firing range active|danger.*active/)) severity = 'critical';
+
+          firEvents.push({
+            id: `notam-${item.notamNumber || item.id || fir.code}-${Date.now().toString(36)}`,
+            timestamp: item.effectiveStart ? new Date(item.effectiveStart).toISOString() : new Date().toISOString(),
+            title: `NOTAM ${fir.name}: ${text.slice(0, 100)}`,
+            summary: text.slice(0, 500),
+            source: 'FAA NOTAM',
+            sourceUrl: `https://notams.aim.faa.gov/notamSearch/nsapp.html#/details/${item.notamNumber || ''}`,
+            type: 'notam',
+            severity,
+            location: { lat: fir.lat, lng: fir.lng, name: fir.name },
+          });
+        }
+        return firEvents;
+      })
+    );
+
+    for (const r of results) {
+      if (r.status === 'fulfilled') events.push(...r.value);
+    }
+
+    if (events.length > 0) {
+      cachedNOTAMEvents = events;
+      lastNOTAMFetch = Date.now();
+    }
+  } catch (err) {
+    console.error('[NOTAM] Fetch failed:', err);
+  }
+
+  return cachedNOTAMEvents.length > 0 ? cachedNOTAMEvents : events;
+}
+
+// ============================================================
+// IAEA Data — Nuclear Safeguards Reports
+// ============================================================
+
+let cachedIAEAEvents: IntelEvent[] = [];
+let lastIAEAFetch: number = 0;
+const IAEA_CACHE_TTL = 60 * 60 * 1000; // 1-hour cache (IAEA publishes infrequently)
+
+export async function fetchIAEAData(): Promise<IntelEvent[]> {
+  if (Date.now() - lastIAEAFetch < IAEA_CACHE_TTL && cachedIAEAEvents.length > 0) {
+    return cachedIAEAEvents;
+  }
+
+  const events: IntelEvent[] = [];
+
+  try {
+    // IAEA News Centre RSS
+    const parsed = await parser.parseURL('https://www.iaea.org/feeds/news-centre').catch(() => null);
+    if (!parsed?.items) return cachedIAEAEvents;
+
+    for (const item of parsed.items.slice(0, 15)) {
+      if (!item.title) continue;
+      const text = `${item.title} ${item.contentSnippet || ''}`;
+      const lower = text.toLowerCase();
+
+      // Filter for Iran nuclear program relevance
+      const isRelevant = lower.match(/iran|enrichment|uranium|centrifuge|safeguards|jcpoa|irgc|fordow|natanz|arak|nuclear.*material|inspectors|verification|non.?compliance/);
+      if (!isRelevant) continue;
+      if (isNonEnglish(item.title)) continue;
+
+      let severity: IntelSeverity = 'medium';
+      if (lower.match(/60.*percent|90.*percent|weapons.?grade|breakout|non.?compliance|denied.*access|kicked.*out/)) severity = 'critical';
+      else if (lower.match(/enrichment.*increase|new.*centrifuge|exceeded|violation|undeclared/)) severity = 'high';
+
+      const location = extractLocation(text);
+
+      events.push({
+        id: `iaea-${item.guid || item.link || item.title?.slice(0, 40)}`,
+        timestamp: item.isoDate || new Date().toISOString(),
+        title: item.title,
+        summary: item.contentSnippet?.slice(0, 400) || '',
+        source: 'IAEA',
+        sourceUrl: item.link,
+        type: 'nuclear',
+        severity,
+        strategicScore: calculateStrategicImpact(text),
+        ...(location && { location }),
+      });
+    }
+
+    if (events.length > 0) {
+      cachedIAEAEvents = events;
+      lastIAEAFetch = Date.now();
+    }
+  } catch (err) {
+    console.error('[IAEA] Fetch failed:', err);
+  }
+
+  return cachedIAEAEvents.length > 0 ? cachedIAEAEvents : events;
+}
+
+// ============================================================
+// Telegram OSINT — Telegram Channel Monitoring
+// ============================================================
+
+let cachedTelegramEvents: IntelEvent[] = [];
+let lastTelegramFetch: number = 0;
+const TELEGRAM_CACHE_TTL = 2 * 60 * 1000; // 2-minute cache (fast-moving)
+
+// Public Telegram channels with conflict OSINT
+const TELEGRAM_CHANNELS = [
+  { handle: 'inikivoino', name: 'War Monitor' },
+  { handle: 'CIG_telegram', name: 'Conflict Intel Group' },
+  { handle: 'Middle_East_Spectator', name: 'ME Spectator' },
+  { handle: 'iran_intel', name: 'Iran Intel' },
+  { handle: 'gazaborninpalestine', name: 'Gaza Reports' },
+];
+
+export async function fetchTelegramOSINT(): Promise<IntelEvent[]> {
+  if (Date.now() - lastTelegramFetch < TELEGRAM_CACHE_TTL && cachedTelegramEvents.length > 0) {
+    return cachedTelegramEvents;
+  }
+
+  const events: IntelEvent[] = [];
+
+  const results = await Promise.allSettled(
+    TELEGRAM_CHANNELS.map(async (channel) => {
+      const channelEvents: IntelEvent[] = [];
+      try {
+        // t.me/s/ is the public preview endpoint — returns HTML
+        const url = `https://t.me/s/${channel.handle}`;
+        const res = await fetch(url, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AegisBot/1.0)' },
+          signal: AbortSignal.timeout(6000),
+        }).catch(() => null);
+
+        if (!res || !res.ok) return [];
+        const html = await res.text();
+
+        // Extract message blocks from Telegram public preview HTML
+        // Each message is in a div with class "tgme_widget_message_text"
+        const messagePattern = /<div class="tgme_widget_message_text[^"]*"[^>]*>([\s\S]*?)<\/div>/g;
+        const timePattern = /<time[^>]+datetime="([^"]+)"/g;
+
+        const messages: string[] = [];
+        let match;
+        while ((match = messagePattern.exec(html)) !== null) {
+          // Strip HTML tags from message content
+          const text = match[1].replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n))).trim();
+          if (text.length > 20) messages.push(text);
+        }
+
+        const timestamps: string[] = [];
+        while ((match = timePattern.exec(html)) !== null) {
+          timestamps.push(match[1]);
+        }
+
+        for (let i = 0; i < Math.min(messages.length, 8); i++) {
+          const text = messages[i];
+          const lower = text.toLowerCase();
+
+          // Filter for conflict relevance
+          const isRelevant = lower.match(/strike|attack|missile|drone|explosion|iron dome|intercept|houthi|hezbollah|idf|irgc|hamas|bombing|shell|artillery|ceasefire|escalat|casualt|kill|dead|wound/);
+          if (!isRelevant) continue;
+          if (isNonEnglish(text)) continue;
+
+          let severity: IntelSeverity = 'medium';
+          if (lower.match(/breaking|urgent|massive|ballistic|nuclear/)) severity = 'critical';
+          else if (lower.match(/strike|attack|missile|explosion|dead|kill/)) severity = 'high';
+
+          const location = extractLocation(text);
+          const timestamp = timestamps[i] || new Date().toISOString();
+
+          channelEvents.push({
+            id: `tg-${channel.handle}-${i}-${new Date(timestamp).getTime().toString(36)}`,
+            timestamp,
+            title: `[${channel.name}] ${text.slice(0, 120)}`,
+            summary: text.slice(0, 500),
+            source: `Telegram: ${channel.name}`,
+            sourceUrl: `https://t.me/${channel.handle}`,
+            type: 'news',
+            severity,
+            strategicScore: calculateStrategicImpact(text),
+            ...(location && { location }),
+          });
+        }
+      } catch {
+        // Channel unavailable, skip
+      }
+      return channelEvents;
+    })
+  );
+
+  for (const r of results) {
+    if (r.status === 'fulfilled') events.push(...r.value);
+  }
+
+  if (events.length > 0) {
+    cachedTelegramEvents = events;
+    lastTelegramFetch = Date.now();
+  }
+
+  return cachedTelegramEvents.length > 0 ? cachedTelegramEvents : events;
+}
+
+// ============================================================
+// Liveuamap Data — Geocoded Conflict Events
+// ============================================================
+
+let cachedLiveuamapEvents: IntelEvent[] = [];
+let lastLiveuamapFetch: number = 0;
+const LIVEUAMAP_CACHE_TTL = 5 * 60 * 1000; // 5-minute cache
+
+export async function fetchLiveuamapData(): Promise<IntelEvent[]> {
+  if (Date.now() - lastLiveuamapFetch < LIVEUAMAP_CACHE_TTL && cachedLiveuamapEvents.length > 0) {
+    return cachedLiveuamapEvents;
+  }
+
+  const events: IntelEvent[] = [];
+
+  try {
+    // Liveuamap has a public RSS feed for Middle East events
+    const feeds = [
+      { url: 'https://liveuamap.com/rss/middleeast', region: 'Middle East' },
+      { url: 'https://liveuamap.com/rss/israel', region: 'Israel' },
+    ];
+
+    const results = await Promise.allSettled(
+      feeds.map(async (feed) => {
+        const feedEvents: IntelEvent[] = [];
+        try {
+          const parsed = await parser.parseURL(feed.url);
+          if (!parsed?.items) return [];
+
+          for (const item of parsed.items.slice(0, 15)) {
+            if (!item.title) continue;
+            const text = `${item.title} ${item.contentSnippet || ''}`;
+            if (isNonEnglish(item.title)) continue;
+
+            const score = calculateStrategicImpact(text);
+            if (score === -999) continue;
+
+            const lower = text.toLowerCase();
+            let severity: IntelSeverity = 'medium';
+            if (lower.match(/ballistic|nuclear|mass casualt/)) severity = 'critical';
+            else if (lower.match(/strike|missile|attack|explosion|dead|kill/)) severity = 'high';
+            else if (lower.match(/warning|deploy|threat/)) severity = 'low';
+
+            // Liveuamap often includes coordinates in content or georss
+            let location = extractLocation(text);
+
+            // Try to extract coords from georss:point or geo fields
+            const geoMatch = (item as any)['georss:point'] || (item as any).geo;
+            if (geoMatch && typeof geoMatch === 'string') {
+              const parts = geoMatch.split(/\s+/);
+              if (parts.length === 2) {
+                const lat = parseFloat(parts[0]);
+                const lng = parseFloat(parts[1]);
+                if (!isNaN(lat) && !isNaN(lng)) {
+                  location = { lat, lng, name: location?.name };
+                }
+              }
+            }
+
+            feedEvents.push({
+              id: `liveuamap-${item.guid || item.link || item.title?.slice(0, 40)}`,
+              timestamp: item.isoDate || new Date().toISOString(),
+              title: item.title,
+              summary: item.contentSnippet?.slice(0, 300) || '',
+              source: `Liveuamap (${feed.region})`,
+              sourceUrl: item.link,
+              type: 'conflict',
+              severity,
+              strategicScore: score,
+              ...(location && { location }),
+            });
+          }
+        } catch {
+          // Feed unavailable
+        }
+        return feedEvents;
+      })
+    );
+
+    for (const r of results) {
+      if (r.status === 'fulfilled') events.push(...r.value);
+    }
+
+    if (events.length > 0) {
+      cachedLiveuamapEvents = events;
+      lastLiveuamapFetch = Date.now();
+    }
+  } catch (err) {
+    console.error('[Liveuamap] Fetch failed:', err);
+  }
+
+  return cachedLiveuamapEvents.length > 0 ? cachedLiveuamapEvents : events;
 }

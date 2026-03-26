@@ -5,18 +5,25 @@ import Map, { Marker, NavigationControl, Source, Layer } from 'react-map-gl/mapl
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { IntelEvent } from '@/lib/types';
 import { STRATEGIC_ASSETS, HISTORICAL_STRIKES } from '@/lib/staticData';
-import { 
-  Activity, 
-  AlertCircle, 
-  Anchor, 
-  Flame, 
-  Plane, 
-  Radio, 
-  Shield, 
-  Ship, 
+import {
+  Activity,
+  AlertCircle,
+  Anchor,
+  Flame,
+  Plane,
+  Radio,
+  Shield,
+  Ship,
   Satellite,
   Globe,
-  Camera
+  Camera,
+  Thermometer,
+  Mountain,
+  CloudRain,
+  HeartHandshake,
+  Layers,
+  ShieldOff,
+  Radiation
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 
@@ -101,6 +108,15 @@ const getCountryCode = (input?: any): string | undefined => {
   return undefined;
 };
 
+import { ICAO_AIRLINES } from '@/lib/airlines';
+
+function lookupAirline(callsign: string): { name: string; country: string } | null {
+  if (!callsign) return null;
+  // Strip digits to get the ICAO airline prefix (e.g. "ELY834" → "ELY")
+  const prefix = callsign.replace(/[0-9]/g, '').toUpperCase();
+  return ICAO_AIRLINES[prefix] || ICAO_AIRLINES[prefix.slice(0, 3)] || null;
+}
+
 const AircraftTooltip = ({ icao24, callsign, type, country, pos }: { icao24: string, callsign: string, type?: string, country?: string, pos: { x: number, y: number } }) => {
   const [photo, setPhoto] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -108,11 +124,17 @@ const AircraftTooltip = ({ icao24, callsign, type, country, pos }: { icao24: str
   useEffect(() => {
     if (!icao24) return;
     setLoading(true);
-    fetch(`https://opensky-network.org/api/metadata/aircraft/images?icao24=${icao24.toLowerCase()}`)
+    // Planespotters.net free API — reliable aircraft photos by ICAO24 hex
+    fetch(`https://api.planespotters.net/pub/photos/hex/${icao24.toUpperCase()}`)
       .then(res => res.json())
       .then(data => {
-        if (data && data.image && data.image.url) setPhoto(data.image.url);
-        else setPhoto(null);
+        const photos = data?.photos;
+        if (photos && photos.length > 0) {
+          // Use thumbnail_large for good quality without being huge
+          setPhoto(photos[0]?.thumbnail_large?.src || photos[0]?.thumbnail?.src || null);
+        } else {
+          setPhoto(null);
+        }
         setLoading(false);
       })
       .catch(() => {
@@ -123,9 +145,10 @@ const AircraftTooltip = ({ icao24, callsign, type, country, pos }: { icao24: str
 
   const icaoHex = icao24 ? icao24.toUpperCase() : 'N/A';
   const safeCallsign = String(callsign || '');
-  const isMil = safeCallsign.match(/RCH|MC|AF|NAVY|MARINES|SAM|VADER|HEX/) || (type && type.includes('Mil'));
-  // Prioritize ICAO hex for flag as it's definitive hardware-coded
-  const countryCode = getCountryCode(icao24) || getCountryCode(country || (isMil ? 'US' : undefined));
+  const airline = lookupAirline(safeCallsign);
+  const isMil = safeCallsign.match(/RCH|CNV|MC|AF|NAVY|MARINES|SAM|VADER|HEX|RRR|IAF/) || (type && type.includes('Mil'));
+  // Use airline country, then ICAO hex prefix, then registration prefix
+  const countryCode = (airline?.country) || getCountryCode(icao24) || getCountryCode(country || (isMil ? 'US' : undefined));
 
   return (
     <div className="fixed z-[1100] pointer-events-none p-3 bg-black/90 backdrop-blur-md border border-white/10 rounded-lg shadow-2xl w-[280px] animate-in fade-in zoom-in duration-200" style={{ left: pos.x + 15, top: pos.y - 120 }}>
@@ -143,21 +166,21 @@ const AircraftTooltip = ({ icao24, callsign, type, country, pos }: { icao24: str
         )}
         <div className={`absolute top-2 right-2 px-1.5 py-0.5 bg-black/60 backdrop-blur border border-white/20 rounded text-[9px] font-bold flex items-center gap-1.5 ${isMil ? 'text-red-400' : 'text-sky-400'}`}>
           <FlagIcon countryCode={countryCode} />
-          {isMil ? 'MILITARY / STATE' : 'CIVILIAN AIRSPACE'}
+          {isMil ? 'MILITARY / STATE' : (airline?.name || 'Unknown Airline')}
         </div>
       </div>
       <div className="space-y-1">
         <h3 className="text-white font-bold uppercase tracking-tight text-sm truncate">{callsign || 'N/A'}</h3>
         <div className="grid grid-cols-2 gap-2 text-[10px]">
-          <div><span className="opacity-40 uppercase block text-[8px]">ICAO24 (Hex)</span><span className="text-blue-300 font-mono">{icaoHex}</span></div>
-          <div><span className="opacity-40 uppercase block text-[8px]">Platform</span><span className="text-emerald-400 truncate block">{type || 'Unknown'}</span></div>
-          <div><span className="opacity-40 uppercase block text-[8px]">Status</span><span className="text-amber-400 animate-pulse">In-Flight / Active</span></div>
-          <div><span className="opacity-40 uppercase block text-[8px]">Registry</span><span className="text-neutral-500 font-mono">OpenSky ADSB</span></div>
+          <div><span className="opacity-40 uppercase block text-[8px]">ICAO24</span><span className="text-blue-300 font-mono">{icaoHex}</span></div>
+          <div><span className="opacity-40 uppercase block text-[8px]">Aircraft</span><span className="text-emerald-400 truncate block">{type || 'Unknown'}</span></div>
+          <div><span className="opacity-40 uppercase block text-[8px]">Registration</span><span className="text-amber-300 font-mono">{country || 'N/A'}</span></div>
+          <div><span className="opacity-40 uppercase block text-[8px]">Airline</span><span className="text-sky-300 truncate block">{airline?.name || (isMil ? 'Military' : 'Unknown')}</span></div>
         </div>
       </div>
-      <div className="mt-3 pt-2 border-t border-white/5 flex items-center gap-1.5 opacity-30">
+      <div className="mt-2 pt-2 border-t border-white/5 flex items-center gap-1.5 opacity-30">
         <Radio className="w-3 h-3 text-blue-400" />
-        <span className="text-[8px] uppercase font-bold tracking-widest">Global ADSB Flight Metadata</span>
+        <span className="text-[8px] uppercase font-bold tracking-widest">FR24 ADSB Transponder</span>
       </div>
     </div>
   );
@@ -194,7 +217,7 @@ interface BallisticTrajectory {
 
 interface IntelMapProps {
   events: IntelEvent[];
-  historicalFilterDays: number; 
+  historicalFilterDays: number;
   showBases: boolean;
   showBoats: boolean;
   showMilitary: boolean;
@@ -203,6 +226,11 @@ interface IntelMapProps {
   showStrikes: boolean;
   showCasualties: boolean;
   showSatellite: boolean;
+  showThermal: boolean;
+  showSeismic: boolean;
+  showWeather: boolean;
+  showHumanitarian: boolean;
+  showHeatmap: boolean;
   usOnly: boolean;
 }
 
@@ -261,19 +289,25 @@ function SatelliteTooltip({ title, summary, imageUrl, source, timestamp, pos }: 
   );
 }
 
-export default function IntelMap({ 
-  events, 
-  historicalFilterDays, 
-  showBases, 
-  showBoats, 
+export default function IntelMap({
+  events,
+  historicalFilterDays,
+  showBases,
+  showBoats,
   showMilitary,
   showCivilian,
-  showAviation, 
+  showAviation,
   showStrikes,
   showCasualties,
   showSatellite,
+  showThermal,
+  showSeismic,
+  showWeather,
+  showHumanitarian,
+  showHeatmap,
   usOnly
 }: IntelMapProps) {
+  const [showGIBSLayer, setShowGIBSLayer] = useState(false);
   
   // ─── BALLISTIC TRAJECTORY ANIMATION STATE ───────────────────────────────────
   const [trajectories, setTrajectories] = useState<BallisticTrajectory[]>([]);
@@ -385,6 +419,10 @@ export default function IntelMap({
     if (!showAviation) locs = locs.filter(e => e.type !== 'aviation');
     if (!showStrikes) locs = locs.filter(e => e.type !== 'strike');
     if (!showSatellite) locs = locs.filter(e => e.type !== 'satellite');
+    if (!showThermal) locs = locs.filter(e => e.type !== 'thermal');
+    if (!showSeismic) locs = locs.filter(e => e.type !== 'seismic');
+    if (!showWeather) locs = locs.filter(e => e.type !== 'weather');
+    if (!showHumanitarian) locs = locs.filter(e => e.type !== 'humanitarian');
 
     // Detailed Naval filtering for locatable SIGINT events
     locs = locs.filter(e => {
@@ -405,14 +443,25 @@ export default function IntelMap({
           return true;
        });
     }
+    // Cap markers to prevent GPU overload — prioritize high-severity and recent
+    if (locs.length > 200) {
+      locs.sort((a, b) => {
+        const sevOrder: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
+        const sevDiff = (sevOrder[b.severity] || 0) - (sevOrder[a.severity] || 0);
+        if (sevDiff !== 0) return sevDiff;
+        return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
+      });
+      locs = locs.slice(0, 200);
+    }
     return locs;
-  }, [events, showAviation, showStrikes, showSatellite, showBoats, showMilitary, showCivilian, historicalFilterDays]);
+  }, [events, showAviation, showStrikes, showSatellite, showThermal, showSeismic, showWeather, showHumanitarian, showBoats, showMilitary, showCivilian, historicalFilterDays]);
 
   const flightLines = useMemo(() => {
     if (!showAviation) return { type: 'FeatureCollection', features: [] };
+    const aviationEvts = events.filter(e => e.type === 'aviation' && e.location).slice(0, 100);
     return {
       type: 'FeatureCollection',
-      features: events.filter(e => e.type === 'aviation' && e.location).map(evt => {
+      features: aviationEvts.map(evt => {
         const speed = evt.entity?.speed || 250;
         const heading = evt.entity?.heading || 0;
         const dist = speed * 900;
@@ -525,7 +574,25 @@ export default function IntelMap({
     return Object.entries(totals).filter(([_, data]) => data.count > 0).map(([name, data]) => ({ name, ...data }));
   }, [events, showCasualties, historicalFilterDays]);
 
-  const [isSatellite, setIsSatellite] = useState(false);
+  const heatmapGeoJSON = useMemo(() => {
+    if (!showHeatmap) return { type: 'FeatureCollection' as const, features: [] };
+    const kinetic = events.filter(e =>
+      e.location && (e.type === 'strike' || e.type === 'conflict' || e.type === 'military' || e.type === 'thermal' || e.type === 'seismic')
+    ).slice(0, 500);
+    return {
+      type: 'FeatureCollection' as const,
+      features: kinetic.map(e => ({
+        type: 'Feature' as const,
+        geometry: { type: 'Point' as const, coordinates: [e.location!.lng, e.location!.lat] },
+        properties: {
+          weight: e.severity === 'critical' ? 4 : e.severity === 'high' ? 3 : e.severity === 'medium' ? 2 : 1,
+          fatalities: e.fatalities || 0,
+        }
+      }))
+    };
+  }, [events, showHeatmap]);
+
+  const [isSatellite, setIsSatellite] = useState(true);
 
   const MAP_STYLES = {
     dark: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
@@ -604,20 +671,45 @@ export default function IntelMap({
       >
         <NavigationControl position="top-right" showCompass={false} />
 
-        {/* Map Style Toggle */}
-        <div className="absolute bottom-4 right-4 z-10">
-          <button
-            onClick={() => setIsSatellite(!isSatellite)}
-            className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition shadow-lg backdrop-blur-md ${
-              isSatellite
-                ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30'
-                : 'bg-black/60 border-white/10 text-neutral-400 hover:text-white hover:bg-black/80'
-            }`}
+        {/* NASA GIBS VIIRS True Color Overlay — real-time satellite imagery tiles */}
+        {showGIBSLayer && (
+          <Source
+            id="nasa-gibs"
+            type="raster"
+            tiles={[
+              `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/${new Date().toISOString().split('T')[0]}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`
+            ]}
+            tileSize={256}
+            attribution="NASA GIBS / VIIRS"
+            maxzoom={9}
           >
-            <Globe className="w-3.5 h-3.5" />
-            {isSatellite ? 'SATELLITE' : 'DARK MAP'}
-          </button>
-        </div>
+            <Layer id="nasa-gibs-layer" type="raster" paint={{ 'raster-opacity': 0.7 }} />
+          </Source>
+        )}
+
+        {showHeatmap && heatmapGeoJSON.features.length > 0 && (
+          <Source id="event-heatmap" type="geojson" data={heatmapGeoJSON}>
+            <Layer
+              id="event-heatmap-layer"
+              type="heatmap"
+              paint={{
+                'heatmap-weight': ['interpolate', ['linear'], ['get', 'weight'], 1, 0.3, 4, 1],
+                'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 0, 1, 9, 3],
+                'heatmap-color': [
+                  'interpolate', ['linear'], ['heatmap-density'],
+                  0, 'rgba(0,0,0,0)',
+                  0.2, 'rgba(103,169,207,0.6)',
+                  0.4, 'rgba(209,229,143,0.7)',
+                  0.6, 'rgba(253,219,119,0.8)',
+                  0.8, 'rgba(239,138,98,0.9)',
+                  1, 'rgba(178,24,43,1)'
+                ],
+                'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 0, 4, 5, 20, 9, 40],
+                'heatmap-opacity': 0.7,
+              }}
+            />
+          </Source>
+        )}
 
         <Source id="missile-arcs" type="geojson" data={missileGeoJSON.arcs}>
           <Layer id="missile-arc-trail" type="line" paint={{ 'line-color': '#ef4444', 'line-width': 2, 'line-dasharray': [4, 3], 'line-opacity': 0.9 }} />
@@ -690,9 +782,15 @@ export default function IntelMap({
         {locatableEvents.map((evt, idx) => {
           const isAviation = evt.type === 'aviation';
           const isNaval = evt.type === 'naval';
-          const isSatellite = evt.type === 'satellite';
+          const isSatelliteEvt = evt.type === 'satellite';
           const isConflict = evt.type === 'conflict';
           const isStrike = evt.type === 'strike';
+          const isThermal = evt.type === 'thermal';
+          const isSeismic = evt.type === 'seismic';
+          const isWeather = evt.type === 'weather';
+          const isHumanitarian = evt.type === 'humanitarian';
+          const isNOTAM = evt.type === 'notam';
+          const isNuclear = evt.type === 'nuclear';
           const hasCasualties = (evt.fatalities || 0) > 0;
           const isHighSeverity = evt.severity === 'high' || evt.severity === 'critical';
 
@@ -720,7 +818,7 @@ export default function IntelMap({
                       source: evt.source,
                     });
                     setHoverPos({ x: e.clientX, y: e.clientY });
-                  } else if (evt.type === 'satellite') {
+                  } else if (evt.type === 'satellite' || evt.type === 'thermal' || evt.type === 'seismic' || evt.type === 'weather' || evt.type === 'humanitarian' || evt.type === 'notam' || evt.type === 'nuclear') {
                     setHoveredSatellite(evt);
                     setHoverPos({ x: e.clientX, y: e.clientY });
                   }
@@ -733,15 +831,27 @@ export default function IntelMap({
               >
                 <div 
                   className={`flex items-center justify-center rounded-full border transition-all duration-300 ${
-                    isAviation 
+                    isAviation
                       ? 'w-4 h-4 bg-blue-500/20 border-blue-500/50 text-blue-400 shadow-[0_0_10px_rgba(59,130,246,0.5)]'
                       : isNaval
                       ? 'w-4 h-4 bg-cyan-500/20 border-cyan-500/50 text-cyan-400'
-                      : isSatellite
+                      : isSatelliteEvt
                       ? 'w-5 h-5 bg-violet-500/20 border-violet-500/50 text-violet-400 shadow-[0_0_15px_rgba(139,92,246,0.5)] animate-pulse'
+                      : isThermal
+                      ? `w-4 h-4 border-amber-500/50 text-amber-400 ${isHighSeverity ? 'bg-amber-500/40 shadow-[0_0_12px_rgba(245,158,11,0.6)] animate-pulse' : 'bg-amber-500/20'}`
+                      : isSeismic
+                      ? `w-4 h-4 border-yellow-500/50 text-yellow-400 ${isHighSeverity ? 'bg-yellow-500/40 shadow-[0_0_12px_rgba(234,179,8,0.6)]' : 'bg-yellow-500/20'}`
+                      : isWeather
+                      ? 'w-4 h-4 bg-sky-500/20 border-sky-500/50 text-sky-400'
+                      : isHumanitarian
+                      ? 'w-4 h-4 bg-pink-500/20 border-pink-500/50 text-pink-400'
+                      : isNOTAM
+                      ? `w-4 h-4 border-indigo-500/50 text-indigo-400 ${isHighSeverity ? 'bg-indigo-500/40 shadow-[0_0_12px_rgba(99,102,241,0.6)]' : 'bg-indigo-500/20'}`
+                      : isNuclear
+                      ? `w-5 h-5 border-fuchsia-500/50 text-fuchsia-400 ${isHighSeverity ? 'bg-fuchsia-500/40 shadow-[0_0_15px_rgba(217,70,239,0.6)] animate-pulse' : 'bg-fuchsia-500/20'}`
                       : (isConflict || isStrike)
                         ? hasCasualties ? 'bg-red-600 border-red-400 text-white font-black shadow-[0_0_15px_rgba(220,38,38,0.8)] scale-125' : 'bg-orange-500/40 border-orange-500/80 text-orange-400'
-                        : isHighSeverity 
+                        : isHighSeverity
                           ? 'bg-red-500/20 border-red-500/50 text-red-500'
                           : 'bg-amber-500/20 border-amber-500/50 text-amber-400'
                   }`}
@@ -753,8 +863,20 @@ export default function IntelMap({
                     <Plane className="w-3 h-3 fill-current" />
                   ) : isNaval ? (
                     <Ship className="w-3 h-3 fill-current" />
-                  ) : isSatellite ? (
+                  ) : isSatelliteEvt ? (
                     <Satellite className="w-3.5 h-3.5" />
+                  ) : isThermal ? (
+                    <Thermometer className="w-3 h-3" />
+                  ) : isSeismic ? (
+                    <Mountain className="w-3 h-3" />
+                  ) : isWeather ? (
+                    <CloudRain className="w-3 h-3" />
+                  ) : isHumanitarian ? (
+                    <HeartHandshake className="w-3 h-3" />
+                  ) : isNOTAM ? (
+                    <ShieldOff className="w-3 h-3" />
+                  ) : isNuclear ? (
+                    <Radiation className="w-3.5 h-3.5" />
                   ) : (isConflict || isStrike) && hasCasualties ? (
                      <span className="text-[12px]">{evt.fatalities}</span>
                   ) : isStrike ? (
@@ -775,6 +897,32 @@ export default function IntelMap({
           );
         })}
       </Map>
+
+      {/* Map Style Toggle — outside <Map> so clicks aren't intercepted */}
+      <div className="absolute bottom-6 right-4 z-20 flex flex-col gap-2">
+        <button
+          onClick={() => setShowGIBSLayer(!showGIBSLayer)}
+          className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition shadow-lg backdrop-blur-md cursor-pointer ${
+            showGIBSLayer
+              ? 'bg-orange-500/20 border-orange-500/40 text-orange-300 hover:bg-orange-500/30'
+              : 'bg-black/60 border-white/10 text-neutral-400 hover:text-white hover:bg-black/80'
+          }`}
+        >
+          <Layers className="w-3.5 h-3.5" />
+          {showGIBSLayer ? 'NASA GIBS ON' : 'NASA GIBS'}
+        </button>
+        <button
+          onClick={() => setIsSatellite(!isSatellite)}
+          className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition shadow-lg backdrop-blur-md cursor-pointer ${
+            isSatellite
+              ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30'
+              : 'bg-black/60 border-white/10 text-neutral-400 hover:text-white hover:bg-black/80'
+          }`}
+        >
+          <Globe className="w-3.5 h-3.5" />
+          {isSatellite ? 'SATELLITE' : 'DARK MAP'}
+        </button>
+      </div>
 
       {hoveredVessel && hoverPos && (
         <div className="fixed z-[1000] pointer-events-none p-3 bg-black/90 backdrop-blur-md border border-white/10 rounded-lg shadow-2xl w-[260px] animate-in fade-in zoom-in duration-200" style={{ left: hoverPos.x + 15, top: hoverPos.y - 100 }}>

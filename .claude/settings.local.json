@@ -4,7 +4,29 @@
       "Bash(npx tsc:*)",
       "Bash(npx next:*)",
       "Bash(source .env.local)",
-      "Bash(npx tsx -e \":*)"
+      "Bash(npx tsx -e \":*)",
+      "WebFetch(domain:apidocs.acleddata.com)",
+      "WebFetch(domain:developer.acleddata.com)",
+      "WebFetch(domain:acleddata.com)",
+      "WebFetch(domain:api.acleddata.com)",
+      "Bash(curl -s -X POST 'https://acleddata.com/oauth/token' -H 'Content-Type: application/x-www-form-urlencoded' -d 'username=nabylb@gmail.com&password=Fat74*Musat&grant_type=password&client_id=acled')",
+      "WebFetch(domain:www.gdeltproject.org)",
+      "WebFetch(domain:data.gdeltproject.org)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(ls:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.exchangerate-api.com)",
+      "WebFetch(domain:portwatch.imf.org)",
+      "WebFetch(domain:cdn.jsdelivr.net)",
+      "Bash(curl -s \"https://api.gdeltproject.org/api/v2/doc/doc?query=%22shipping+disruption%22+OR+%22red+sea+attack%22+OR+%22houthi+ship%22&mode=timelinevol&timespan=30d&format=json\")",
+      "Bash(curl -s \"https://api.gdeltproject.org/api/v2/doc/doc?query=%28%22shipping+disruption%22+OR+%22red+sea+attack%22+OR+%22houthi+ship%22+OR+%22strait+of+hormuz%22%29&mode=timelinevol&timespan=30d&format=json\")",
+      "Bash(python3 -c \":*)",
+      "Bash(curl -s \"https://data-cloud.flightradar24.com/zones/fcgi/feed.js?bounds=40.00,12.00,33.00,63.00&faa=1&satellite=1&mlat=1&flarm=1&adsb=1&gnd=0&air=1&vehicles=0&estimated=1&maxage=14400&gliders=0&stats=0\" -H \"User-Agent: Mozilla/5.0 \\(Macintosh; Intel Mac OS X 10_15_7\\) AppleWebKit/537.36\" -H \"Accept: application/json\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/jpatokal/openflights/master/data/airlines.dat\")",
+      "Bash(python3:*)"
     ]
   }
 }

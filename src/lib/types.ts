@@ -1,6 +1,6 @@
 export type IntelSeverity = 'low' | 'medium' | 'high' | 'critical';
 
-export type IntelEventType = 'aviation' | 'naval' | 'news' | 'conflict' | 'military' | 'strike' | 'satellite';
+export type IntelEventType = 'aviation' | 'naval' | 'news' | 'conflict' | 'military' | 'strike' | 'satellite' | 'thermal' | 'seismic' | 'weather' | 'humanitarian' | 'notam' | 'nuclear';
 
 export interface IntelEvent {
   id: string;             // Unique identifier for the event
