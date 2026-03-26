@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc:*)",
+      "Bash(npx next:*)",
+      "Bash(source .env.local)",
+      "Bash(npx tsx -e \":*)"
+    ]
+  }
+}
