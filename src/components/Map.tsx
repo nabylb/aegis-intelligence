@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useMemo, useState, useEffect, useRef } from 'react';
+import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import Map, { Marker, NavigationControl, Source, Layer } from 'react-map-gl/maplibre';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { IntelEvent } from '@/lib/types';
@@ -112,12 +112,118 @@ import { ICAO_AIRLINES } from '@/lib/airlines';
 
 function lookupAirline(callsign: string): { name: string; country: string } | null {
   if (!callsign) return null;
-  // Strip digits to get the ICAO airline prefix (e.g. "ELY834" → "ELY")
   const prefix = callsign.replace(/[0-9]/g, '').toUpperCase();
   return ICAO_AIRLINES[prefix] || ICAO_AIRLINES[prefix.slice(0, 3)] || null;
 }
 
-const AircraftTooltip = ({ icao24, callsign, type, country, pos }: { icao24: string, callsign: string, type?: string, country?: string, pos: { x: number, y: number } }) => {
+// Image lookup chain: Wikipedia → Wikipedia search → Wikimedia Commons
+// Global cache shared across all component instances
+const wikiImageCache: Record<string, string | null> = {};
+
+function useWikipediaImage(query: string | undefined) {
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!query) return;
+    if (wikiImageCache[query] !== undefined) {
+      setImageUrl(wikiImageCache[query]);
+      return;
+    }
+    setImageUrl(null);
+
+    // Wikipedia page summary (fastest)
+    const tryWikiSummary = (q: string): Promise<string | null> =>
+      fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(q)}`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => d?.thumbnail?.source || d?.originalimage?.source || null)
+        .catch(() => null);
+
+    // Wikipedia search → get summary of top result
+    const tryWikiSearch = (q: string): Promise<string | null> =>
+      fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json&origin=*&srlimit=1`)
+        .then(r => r.json())
+        .then(d => {
+          const title = d?.query?.search?.[0]?.title;
+          return title ? tryWikiSummary(title) : null;
+        })
+        .catch(() => null);
+
+    // Wikimedia Commons: search File namespace, then get thumbnail
+    const tryCommonsSearch = (q: string): Promise<string | null> =>
+      fetch(`https://commons.wikimedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&srnamespace=6&srlimit=1&format=json&origin=*`)
+        .then(r => r.json())
+        .then(d => {
+          const title = d?.query?.search?.[0]?.title;
+          if (!title) return null;
+          return fetch(`https://commons.wikimedia.org/w/api.php?action=query&titles=${encodeURIComponent(title)}&prop=imageinfo&iiprop=url&iiurlwidth=500&format=json&origin=*`)
+            .then(r2 => r2.json())
+            .then(d2 => {
+              for (const page of Object.values(d2?.query?.pages || {}) as any[]) {
+                const info = page?.imageinfo?.[0];
+                if (info?.thumburl) return info.thumburl;
+                if (info?.url && /\.(jpg|jpeg|png|webp)/i.test(info.url)) return info.url;
+              }
+              return null;
+            });
+        })
+        .catch(() => null);
+
+    (async () => {
+      let img: string | null = null;
+
+      // 1. Direct Wikipedia summary
+      img = await tryWikiSummary(query);
+
+      // 2. Wikipedia search
+      if (!img) img = await tryWikiSearch(query);
+
+      // 3. Wikimedia Commons (great for military vessels worldwide)
+      if (!img) img = await tryCommonsSearch(query);
+
+      // 4. Strip parentheticals and retry Commons (e.g. "USS Boxer (LHD-4)" → "USS Boxer")
+      if (!img && query.includes('(')) {
+        const clean = query.replace(/\s*\(.*?\)\s*/g, '').trim();
+        img = await tryCommonsSearch(clean);
+      }
+
+      // 5. For military vessels, try adding "warship" to Commons search
+      if (!img && /^(USS|HMS|INS|ROKS|JS|FNS|TCG|ARA|IRIS|PLANS|ENS|HMCS|HMAS)\s/.test(query)) {
+        img = await tryCommonsSearch(query + ' warship');
+      }
+
+      // 6. Try Wikidata entity image (covers many military items)
+      if (!img) {
+        try {
+          const wdSearch = await fetch(`https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(query)}&language=en&limit=1&format=json&origin=*`).then(r => r.json());
+          const entityId = wdSearch?.search?.[0]?.id;
+          if (entityId) {
+            const wdEntity = await fetch(`https://www.wikidata.org/w/api.php?action=wbgetclaims&entity=${entityId}&property=P18&format=json&origin=*`).then(r => r.json());
+            const fileName = wdEntity?.claims?.P18?.[0]?.mainsnak?.datavalue?.value;
+            if (fileName) {
+              img = `https://commons.wikimedia.org/w/thumb.php?f=${encodeURIComponent(fileName.replace(/ /g, '_'))}&w=500`;
+            }
+          }
+        } catch {}
+      }
+
+      // 7. Final fallback: server-side Google Image search
+      if (!img) {
+        try {
+          const res = await fetch(`/api/image-search?q=${encodeURIComponent(query)}`);
+          const data = await res.json();
+          if (data?.image) img = data.image;
+        } catch {}
+      }
+
+      wikiImageCache[query] = img;
+      setImageUrl(img);
+    })();
+  }, [query]);
+
+  return imageUrl;
+}
+
+const AircraftTooltip = ({ icao24, callsign, type, country, origin, destination, sourceUrl, pos, onClose }: { icao24: string, callsign: string, type?: string, country?: string, origin?: string, destination?: string, sourceUrl?: string, pos: { x: number, y: number }, onClose: () => void }) => {
   const [photo, setPhoto] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -151,7 +257,8 @@ const AircraftTooltip = ({ icao24, callsign, type, country, pos }: { icao24: str
   const countryCode = (airline?.country) || getCountryCode(icao24) || getCountryCode(country || (isMil ? 'US' : undefined));
 
   return (
-    <div className="fixed z-[1100] pointer-events-none p-3 bg-black/90 backdrop-blur-md border border-white/10 rounded-lg shadow-2xl w-[280px] animate-in fade-in zoom-in duration-200" style={{ left: pos.x + 15, top: pos.y - 120 }}>
+    <div className="fixed z-[1100] p-3 bg-black/90 backdrop-blur-md border border-white/10 rounded-lg shadow-2xl w-[280px] animate-in fade-in zoom-in duration-200" style={{ left: Math.min(pos.x + 15, window.innerWidth - 300), top: Math.min(pos.y - 120, window.innerHeight - 400) }} onClick={(e) => e.stopPropagation()}>
+      <button onClick={onClose} className="absolute top-1.5 right-1.5 z-10 w-5 h-5 flex items-center justify-center rounded-full bg-black/60 text-neutral-500 hover:text-white text-[10px] transition">✕</button>
       <div className="relative w-full h-[150px] bg-neutral-800 rounded mb-2 overflow-hidden border border-white/5">
         {loading ? (
           <div className="w-full h-full flex items-center justify-center"><Activity className="w-6 h-6 text-blue-500 animate-pulse" /></div>
@@ -161,10 +268,10 @@ const AircraftTooltip = ({ icao24, callsign, type, country, pos }: { icao24: str
           <div className="w-full h-full flex flex-col items-center justify-center p-4 text-center">
             <Plane className="w-12 h-12 text-neutral-700 mb-2" />
             <div className="text-[10px] text-neutral-500 uppercase tracking-widest font-bold">Registry Photo Unavailable</div>
-            <div className="text-[8px] text-neutral-600 mt-1 uppercase italic">Displaying platform type: {type || 'Generic Airframe'}</div>
+            <div className="text-[8px] text-neutral-600 mt-1 uppercase italic">Platform: {type || 'Generic Airframe'}</div>
           </div>
         )}
-        <div className={`absolute top-2 right-2 px-1.5 py-0.5 bg-black/60 backdrop-blur border border-white/20 rounded text-[9px] font-bold flex items-center gap-1.5 ${isMil ? 'text-red-400' : 'text-sky-400'}`}>
+        <div className={`absolute top-2 left-2 px-1.5 py-0.5 bg-black/60 backdrop-blur border border-white/20 rounded text-[9px] font-bold flex items-center gap-1.5 ${isMil ? 'text-red-400' : 'text-sky-400'}`}>
           <FlagIcon countryCode={countryCode} />
           {isMil ? 'MILITARY / STATE' : (airline?.name || 'Unknown Airline')}
         </div>
@@ -176,11 +283,148 @@ const AircraftTooltip = ({ icao24, callsign, type, country, pos }: { icao24: str
           <div><span className="opacity-40 uppercase block text-[8px]">Aircraft</span><span className="text-emerald-400 truncate block">{type || 'Unknown'}</span></div>
           <div><span className="opacity-40 uppercase block text-[8px]">Registration</span><span className="text-amber-300 font-mono">{country || 'N/A'}</span></div>
           <div><span className="opacity-40 uppercase block text-[8px]">Airline</span><span className="text-sky-300 truncate block">{airline?.name || (isMil ? 'Military' : 'Unknown')}</span></div>
+          {origin && <div><span className="opacity-40 uppercase block text-[8px]">Origin</span><span className="text-neutral-300 font-mono">{origin}</span></div>}
+          {destination && <div><span className="opacity-40 uppercase block text-[8px]">Dest</span><span className="text-neutral-300 font-mono">{destination}</span></div>}
         </div>
       </div>
-      <div className="mt-2 pt-2 border-t border-white/5 flex items-center gap-1.5 opacity-30">
-        <Radio className="w-3 h-3 text-blue-400" />
-        <span className="text-[8px] uppercase font-bold tracking-widest">FR24 ADSB Transponder</span>
+      <div className="mt-2 pt-2 border-t border-white/5 flex items-center justify-between">
+        <span className="text-[8px] uppercase font-bold tracking-widest text-neutral-600">ADSB Transponder</span>
+        <div className="flex gap-2">
+          <a href={`https://www.flightradar24.com/${safeCallsign}`} target="_blank" rel="noopener noreferrer" className="text-[8px] text-sky-400 hover:text-sky-300 underline underline-offset-2 font-bold uppercase">FR24</a>
+          {sourceUrl && <a href={sourceUrl} target="_blank" rel="noopener noreferrer" className="text-[8px] text-sky-400 hover:text-sky-300 underline underline-offset-2 font-bold uppercase">Source</a>}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Vessel modal component with Wikipedia image fallback
+const VesselModal = ({ vessel, pos, onClose }: { vessel: any, pos: { x: number, y: number }, onClose: () => void }) => {
+  // Build a good search query: military vessels get searched by name directly, civilian vessels add "ship"
+  const searchQuery = (() => {
+    if (!vessel.name || vessel.name === 'UNKNOWN VESSEL') return undefined;
+    const name = vessel.name;
+    // Military prefixes — search directly (Wikipedia has articles like "USS Abraham Lincoln")
+    if (/^(USS|HMS|INS|ROKS|JS|FNS|TCG|ARA|HMCS|HMAS|KRI|RMN|RSN)\s/.test(name)) return name;
+    if (vessel.isMilitary) return name + ' warship';
+    return name + ' ship';
+  })();
+  const wikiImage = useWikipediaImage(searchQuery);
+  const [mtFailed, setMtFailed] = useState(false);
+  const mtPhotoSrc = vessel.photoUrl || (vessel.mmsi ? `https://photos.marinetraffic.com/ais/showphoto.aspx?mmsi=${vessel.mmsi}` : null);
+  const displayImage = (!mtFailed && mtPhotoSrc) ? mtPhotoSrc : wikiImage;
+
+  return (
+    <div className="fixed z-[1000] p-3 bg-black/95 backdrop-blur-md border border-cyan-500/20 rounded-xl shadow-2xl w-[280px] animate-in fade-in zoom-in duration-200" style={{ left: Math.min(pos.x + 15, window.innerWidth - 300), top: Math.min(Math.max(pos.y - 100, 10), window.innerHeight - 450) }} onClick={(e) => e.stopPropagation()}>
+      <button onClick={onClose} className="absolute top-1.5 right-1.5 z-10 w-5 h-5 flex items-center justify-center rounded-full bg-black/60 text-neutral-500 hover:text-white text-[10px] transition">✕</button>
+      <div className="relative w-full h-[140px] bg-neutral-800 rounded-lg mb-2 overflow-hidden border border-white/5">
+        {displayImage ? (
+          <img src={displayImage} className="w-full h-full object-cover" referrerPolicy="no-referrer"
+            onError={() => { if (!mtFailed && mtPhotoSrc) setMtFailed(true); }} />
+        ) : (
+          <div className="w-full h-full flex flex-col items-center justify-center">
+            <Ship className="w-10 h-10 text-neutral-700" />
+            <span className="text-[9px] text-neutral-600 mt-2 uppercase tracking-wider">{wikiImage === null ? 'Photo Unavailable' : 'Loading...'}</span>
+          </div>
+        )}
+        <div className={`absolute top-2 left-2 px-1.5 py-0.5 bg-black/70 backdrop-blur border border-white/20 rounded text-[9px] font-bold flex items-center gap-1.5 ${vessel.isMilitary ? 'text-blue-400' : 'text-cyan-400'}`}>
+          <FlagIcon countryCode={getCountryCode(vessel.faction || vessel.mmsi)} />
+          {vessel.isMilitary ? 'MILITARY VESSEL' : 'CIVILIAN VESSEL'}
+        </div>
+      </div>
+      <div className="space-y-1.5">
+        <h3 className="text-white font-bold uppercase tracking-tight text-sm truncate">{vessel.name || 'UNKNOWN VESSEL'}</h3>
+        <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-[10px]">
+          <div><span className="opacity-40 uppercase block text-[8px]">Callsign</span><span className="text-blue-300 font-mono">{vessel.callsign || 'N/A'}</span></div>
+          <div><span className="opacity-40 uppercase block text-[8px]">Destination</span><span className="text-emerald-400 truncate block">{vessel.destination || 'Open Sea'}</span></div>
+          <div><span className="opacity-40 uppercase block text-[8px]">Speed</span><span className="text-amber-400">{vessel.speed ? `${vessel.speed} kn` : '0 kn'}</span></div>
+          <div><span className="opacity-40 uppercase block text-[8px]">MMSI</span><span className="text-neutral-400 font-mono">{vessel.mmsi || 'N/A'}</span></div>
+        </div>
+      </div>
+      <div className="mt-2 pt-2 border-t border-white/5 flex items-center justify-between">
+        <span className="text-[8px] uppercase font-bold tracking-widest text-neutral-600">AIS Transponder</span>
+        <div className="flex gap-2">
+          {vessel.mmsi && <a href={`https://www.marinetraffic.com/en/ais/details/ships/mmsi:${vessel.mmsi}`} target="_blank" rel="noopener noreferrer" className="text-[9px] text-cyan-400 hover:text-cyan-300 underline underline-offset-2 font-bold">MarineTraffic →</a>}
+          {vessel.sourceUrl && <a href={vessel.sourceUrl} target="_blank" rel="noopener noreferrer" className="text-[9px] text-cyan-400 hover:text-cyan-300 underline underline-offset-2 font-bold">Source</a>}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Strategic asset modal with Wikipedia image fallback
+const AssetModal = ({ asset, pos, onClose }: { asset: typeof STRATEGIC_ASSETS[0], pos: { x: number, y: number }, onClose: () => void }) => {
+  const isShip = asset.type === 'boat' || asset.type === 'carrier' || asset.type === 'submarine';
+  const isIncident = isShip && asset.faction === 'neutral';
+  const isBase = asset.type === 'base' || asset.type === 'oil_field';
+  const isChokepoint = asset.type === 'chokepoint';
+
+  // Try Wikipedia for image when no photoUrl
+  const wikiQuery = asset.name.replace(/\s*\(.*?\)\s*/g, '').trim();
+  const wikiImage = useWikipediaImage(!asset.photoUrl ? wikiQuery : undefined);
+  const [photoFailed, setPhotoFailed] = useState(false);
+  const displayImage = (!photoFailed && asset.photoUrl) ? asset.photoUrl : wikiImage;
+
+  const factionColors: Record<string, string> = { us: 'border-blue-500/30', israel: 'border-blue-500/30', uk: 'border-blue-400/30', france: 'border-indigo-500/30', turkey: 'border-teal-500/30', saudi: 'border-emerald-500/30', uae: 'border-emerald-500/30', qatar: 'border-emerald-500/30', egypt: 'border-amber-500/30', jordan: 'border-amber-500/30', iraq: 'border-amber-500/30', iran: 'border-red-500/30', yemen: 'border-red-500/30', russia: 'border-red-500/30', china: 'border-rose-500/30', india: 'border-orange-500/30', neutral: 'border-orange-500/30' };
+  const factionLabels: Record<string, string> = { us: 'United States', israel: 'Israel', uk: 'United Kingdom', france: 'France', turkey: 'Turkey', saudi: 'Saudi Arabia', uae: 'UAE', qatar: 'Qatar', bahrain: 'Bahrain', oman: 'Oman', egypt: 'Egypt', jordan: 'Jordan', iraq: 'Iraq', iran: 'Iran', yemen: 'Yemen / Houthi', russia: 'Russia', china: 'China', india: 'India', neutral: 'Incident' };
+  const factionBadgeColors: Record<string, string> = { us: 'text-blue-400', israel: 'text-blue-400', uk: 'text-blue-300', france: 'text-indigo-400', turkey: 'text-teal-400', saudi: 'text-emerald-400', uae: 'text-emerald-400', qatar: 'text-emerald-400', egypt: 'text-amber-400', jordan: 'text-amber-400', iraq: 'text-amber-400', iran: 'text-red-400', yemen: 'text-red-400', russia: 'text-red-400', china: 'text-rose-400', india: 'text-orange-400', neutral: 'text-orange-400' };
+  const mtUrl = asset.mmsi ? `https://www.marinetraffic.com/en/ais/details/ships/mmsi:${asset.mmsi}` : null;
+
+  return (
+    <div className={`fixed z-[1001] p-3 bg-black/95 backdrop-blur-xl ${factionColors[asset.faction] || 'border-white/10'} border rounded-xl shadow-2xl w-[300px] animate-in fade-in zoom-in duration-200`}
+      style={{ left: Math.min(pos.x + 15, window.innerWidth - 320), top: Math.min(Math.max(pos.y - 120, 10), window.innerHeight - 480) }}
+      onClick={(e) => e.stopPropagation()}>
+      <button onClick={onClose} className="absolute top-2 right-2 z-10 w-5 h-5 flex items-center justify-center rounded-full bg-black/60 text-neutral-500 hover:text-white text-[10px] transition">✕</button>
+      {displayImage && (
+        <div className="relative w-full h-[150px] bg-neutral-800 rounded-lg mb-3 overflow-hidden border border-white/5">
+          <img src={displayImage} className="w-full h-full object-cover" referrerPolicy="no-referrer"
+            onError={() => { if (!photoFailed && asset.photoUrl) setPhotoFailed(true); }} />
+          <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent pointer-events-none" />
+          {isIncident && (
+            <div className="absolute top-2 left-2 px-1.5 py-0.5 bg-orange-600/90 text-white text-[8px] font-bold rounded flex items-center gap-1">
+              <AlertCircle className="w-2.5 h-2.5" /> MARITIME INCIDENT
+            </div>
+          )}
+          {!isIncident && (
+            <div className={`absolute top-2 left-2 px-1.5 py-0.5 bg-black/70 backdrop-blur rounded text-[8px] font-bold flex items-center gap-1.5 ${factionBadgeColors[asset.faction]}`}>
+              <FlagIcon countryCode={asset.country} />
+              {factionLabels[asset.faction] || asset.faction.toUpperCase()}
+            </div>
+          )}
+        </div>
+      )}
+      {!displayImage && (
+        <div className="relative w-full h-[80px] bg-neutral-900 rounded-lg mb-3 overflow-hidden border border-white/5 flex items-center justify-center">
+          {isBase ? <Shield className="w-8 h-8 text-neutral-700" /> : isChokepoint ? <Anchor className="w-8 h-8 text-neutral-700" /> : <Ship className="w-8 h-8 text-neutral-700" />}
+          <div className={`absolute top-2 left-2 px-1.5 py-0.5 bg-black/70 backdrop-blur rounded text-[8px] font-bold flex items-center gap-1.5 ${factionBadgeColors[asset.faction]}`}>
+            <FlagIcon countryCode={asset.country} />
+            {factionLabels[asset.faction] || asset.faction.toUpperCase()}
+          </div>
+        </div>
+      )}
+      <div className="flex items-start gap-2 mb-2">
+        <div className={`p-1.5 rounded-lg border shrink-0 mt-0.5 ${isIncident ? 'bg-orange-500/10 border-orange-500/30' : 'bg-white/5 border-white/10'}`}>
+          {isIncident ? <AlertCircle className="w-4 h-4 text-orange-400" /> : isBase ? <Shield className="w-4 h-4 text-blue-400" /> : isChokepoint ? <Anchor className="w-4 h-4 text-amber-400" /> : <Ship className="w-4 h-4 text-cyan-400" />}
+        </div>
+        <div className="min-w-0 flex-1">
+          <h3 className="text-white font-bold text-xs leading-tight">{asset.name}</h3>
+          <span className={`text-[9px] font-bold ${factionBadgeColors[asset.faction]}`}>
+            {isIncident ? 'Maritime Incident' : isBase ? (asset.type === 'oil_field' ? 'Energy Infrastructure' : 'Military Installation') : isChokepoint ? 'Strategic Chokepoint' : asset.type === 'carrier' ? 'Aircraft Carrier Group' : asset.type === 'submarine' ? 'Submarine' : 'Military Vessel'}
+          </span>
+        </div>
+      </div>
+      <p className="text-[11px] text-neutral-400 leading-relaxed mb-2">{asset.description}</p>
+      <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px] mb-2">
+        <div><span className="opacity-40 uppercase text-[8px]">Position </span><span className="text-neutral-400 font-mono">{asset.lat.toFixed(2)}°, {asset.lng.toFixed(2)}°</span></div>
+        <div><span className="opacity-40 uppercase text-[8px]">Faction </span><span className={factionBadgeColors[asset.faction]}>{factionLabels[asset.faction]}</span></div>
+        {asset.mmsi && <div><span className="opacity-40 uppercase text-[8px]">MMSI </span><span className="text-neutral-400 font-mono">{asset.mmsi}</span></div>}
+      </div>
+      <div className="flex items-center justify-between pt-2 border-t border-white/5">
+        <span className="text-[8px] uppercase font-bold tracking-widest text-neutral-600">{isIncident ? 'Incident' : isBase ? 'Installation' : 'Asset'}</span>
+        <div className="flex gap-2">
+          {mtUrl && <a href={mtUrl} target="_blank" rel="noopener noreferrer" className="text-[9px] text-cyan-400 hover:text-cyan-300 underline underline-offset-2 font-bold">MarineTraffic →</a>}
+          <a href={`https://en.wikipedia.org/wiki/${encodeURIComponent(wikiQuery)}`} target="_blank" rel="noopener noreferrer" className="text-[9px] text-sky-400 hover:text-sky-300 underline underline-offset-2 font-bold">Wikipedia →</a>
+        </div>
       </div>
     </div>
   );
@@ -234,60 +478,147 @@ interface IntelMapProps {
   usOnly: boolean;
 }
 
-function SatelliteTooltip({ title, summary, imageUrl, source, timestamp, pos }: { 
-  title: string; 
-  summary?: string; 
-  imageUrl?: string; 
-  source: string;
-  timestamp: string;
-  pos: { x: number, y: number } 
+// Universal event tooltip — adapts color/icon based on event type
+function EventTooltip({ evt, pos, onClose }: {
+  evt: IntelEvent;
+  pos: { x: number, y: number };
+  onClose: () => void;
 }) {
-  return (
-    <div 
-      className="fixed z-[1001] pointer-events-none p-4 bg-black/90 backdrop-blur-xl border border-violet-500/30 rounded-xl shadow-[0_0_30px_rgba(139,92,246,0.3)] w-[320px] animate-in fade-in zoom-in duration-200" 
-      style={{ left: pos.x + 20, top: pos.y - 120 }}
-    >
-      <div className="flex items-center gap-2 mb-3">
-        <div className="p-1.5 bg-violet-500/20 rounded-lg border border-violet-500/40">
-          <Satellite className="w-4 h-4 text-violet-400" />
-        </div>
-        <div>
-          <h3 className="text-white font-bold text-xs uppercase tracking-widest truncate">{title}</h3>
-          <p className="text-[9px] text-violet-400/70 font-mono italic">RECON PASS: {formatDistanceToNow(new Date(timestamp))} ago</p>
-        </div>
-      </div>
+  const typeConfig: Record<string, { color: string, border: string, icon: React.ReactNode, label: string }> = {
+    satellite: { color: 'text-violet-400', border: 'border-violet-500/30', icon: <Satellite className="w-4 h-4 text-violet-400" />, label: 'Satellite Intelligence' },
+    strike: { color: 'text-red-400', border: 'border-red-500/30', icon: <Flame className="w-4 h-4 text-red-400" />, label: 'Strike Event' },
+    conflict: { color: 'text-orange-400', border: 'border-orange-500/30', icon: <AlertCircle className="w-4 h-4 text-orange-400" />, label: 'Armed Conflict' },
+    thermal: { color: 'text-amber-400', border: 'border-amber-500/30', icon: <Thermometer className="w-4 h-4 text-amber-400" />, label: 'Thermal Detection (NASA FIRMS)' },
+    seismic: { color: 'text-yellow-400', border: 'border-yellow-500/30', icon: <Mountain className="w-4 h-4 text-yellow-400" />, label: 'Seismic Event (USGS)' },
+    weather: { color: 'text-sky-400', border: 'border-sky-500/30', icon: <CloudRain className="w-4 h-4 text-sky-400" />, label: 'Weather Alert' },
+    humanitarian: { color: 'text-pink-400', border: 'border-pink-500/30', icon: <HeartHandshake className="w-4 h-4 text-pink-400" />, label: 'Humanitarian Crisis' },
+    notam: { color: 'text-indigo-400', border: 'border-indigo-500/30', icon: <ShieldOff className="w-4 h-4 text-indigo-400" />, label: 'Airspace Notice (NOTAM)' },
+    nuclear: { color: 'text-fuchsia-400', border: 'border-fuchsia-500/30', icon: <Radiation className="w-4 h-4 text-fuchsia-400" />, label: 'Nuclear Activity (IAEA)' },
+    news: { color: 'text-neutral-300', border: 'border-white/10', icon: <Globe className="w-4 h-4 text-neutral-400" />, label: 'News Report' },
+    military: { color: 'text-blue-400', border: 'border-blue-500/30', icon: <Shield className="w-4 h-4 text-blue-400" />, label: 'Military Activity' },
+  };
+  const cfg = typeConfig[evt.type] || typeConfig.news;
+  const sevColors: Record<string, string> = { critical: 'bg-red-500', high: 'bg-orange-500', medium: 'bg-yellow-500', low: 'bg-emerald-500' };
 
-      {imageUrl && (
-        <div className="relative w-full h-[180px] bg-neutral-900 rounded-lg mb-3 overflow-hidden border border-white/10 group">
-          <img 
-            src={imageUrl} 
-            className="w-full h-full object-cover grayscale-[0.3] hover:grayscale-0 transition-all duration-700 scale-110 hover:scale-100" 
+  return (
+    <div
+      className={`fixed z-[1001] p-3 bg-black/95 backdrop-blur-xl ${cfg.border} border rounded-xl shadow-2xl w-[320px] animate-in fade-in zoom-in duration-200`}
+      style={{ left: Math.min(pos.x + 20, window.innerWidth - 340), top: Math.min(Math.max(pos.y - 120, 10), window.innerHeight - 500) }}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <button onClick={onClose} className="absolute top-2 right-2 z-10 w-5 h-5 flex items-center justify-center rounded-full bg-black/60 text-neutral-500 hover:text-white text-[10px] transition">✕</button>
+
+      {/* Image */}
+      {evt.payloadImage && (
+        <div className="relative w-full h-[160px] bg-neutral-900 rounded-lg mb-3 overflow-hidden border border-white/10">
+          <img
+            src={evt.payloadImage}
+            className="w-full h-full object-cover"
             referrerPolicy="no-referrer"
-            onError={(e: any) => { e.target.onerror = null; e.target.src = "https://placehold.co/400x300/0a0a0a/666?text=RECON+DATA+ENCRYPTED"; }}
+            onError={(e: any) => { e.target.style.display = 'none'; }}
           />
-          <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent pointer-events-none" />
-          <div className="absolute top-2 right-2 px-1.5 py-0.5 bg-violet-600 text-white text-[8px] font-bold rounded uppercase tracking-tighter flex items-center gap-1">
-             <Camera className="w-2.5 h-2.5" /> PAYLOAD
-          </div>
-          <div className="absolute bottom-2 left-2 flex gap-1 items-center">
-             <div className="w-1 h-1 bg-red-500 rounded-full animate-ping" />
-             <span className="text-[8px] font-mono text-white/50 tracking-widest">SAT-VIEW V4.2</span>
-          </div>
+          <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent pointer-events-none" />
         </div>
       )}
 
-      <div className="space-y-2">
-        <div className="text-[11px] text-neutral-300 leading-relaxed font-medium">
-          {summary || 'No detailed analysis provided.'}
+      {/* Header */}
+      <div className="flex items-start gap-2 mb-2">
+        <div className="p-1.5 bg-white/5 rounded-lg border border-white/10 shrink-0 mt-0.5">
+          {cfg.icon}
         </div>
-        <div className="flex items-center justify-between pt-2 border-t border-white/5">
-          <span className="text-[9px] text-neutral-500 font-bold uppercase tracking-widest">{source}</span>
-          <span className="text-[9px] px-2 py-0.5 bg-white/5 rounded text-neutral-400 border border-white/5">TOP SECRET</span>
+        <div className="min-w-0 flex-1">
+          <h3 className="text-white font-bold text-xs leading-tight">{evt.title}</h3>
+          <div className="flex items-center gap-2 mt-1">
+            <span className={`text-[9px] font-bold ${cfg.color}`}>{cfg.label}</span>
+            <div className={`w-1.5 h-1.5 rounded-full ${sevColors[evt.severity] || sevColors.low}`} />
+            <span className="text-[9px] text-neutral-500 uppercase">{evt.severity}</span>
+          </div>
         </div>
+      </div>
+
+      {/* Summary */}
+      {evt.summary && (
+        <p className="text-[11px] text-neutral-400 leading-relaxed mb-2">{evt.summary}</p>
+      )}
+
+      {/* Details grid */}
+      <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px] mb-2">
+        {evt.location?.name && (
+          <div className="col-span-2"><span className="opacity-40 uppercase text-[8px]">Location </span><span className="text-neutral-300">{evt.location.name}</span></div>
+        )}
+        {evt.location && (
+          <div><span className="opacity-40 uppercase text-[8px]">Coords </span><span className="text-neutral-500 font-mono">{evt.location.lat.toFixed(2)}, {evt.location.lng.toFixed(2)}</span></div>
+        )}
+        <div><span className="opacity-40 uppercase text-[8px]">Time </span><span className="text-neutral-400">{formatDistanceToNow(new Date(evt.timestamp))} ago</span></div>
+        {evt.fatalities != null && evt.fatalities > 0 && (
+          <div><span className="opacity-40 uppercase text-[8px]">Fatalities </span><span className="text-red-400 font-bold">{evt.fatalities}</span></div>
+        )}
+      </div>
+
+      {/* Footer with source */}
+      <div className="flex items-center justify-between pt-2 border-t border-white/5">
+        <span className="text-[9px] text-neutral-600 font-bold uppercase tracking-wider truncate max-w-[150px]">{evt.source}</span>
+        {evt.sourceUrl ? (
+          <a href={evt.sourceUrl} target="_blank" rel="noopener noreferrer" className={`text-[9px] ${cfg.color} hover:opacity-80 underline underline-offset-2 font-bold`}>View Source →</a>
+        ) : (
+          <span className="text-[9px] text-neutral-600">No link available</span>
+        )}
       </div>
     </div>
   );
 }
+
+// ─── EXTRACTED CONSTANTS (avoid re-creation per render) ──────────────────────
+
+const FACTION_COLOR_MAP: Record<string, string> = {
+  us: 'bg-blue-600/30 border-blue-400 text-blue-300 shadow-[0_0_10px_rgba(59,130,246,0.3)]',
+  israel: 'bg-blue-600/30 border-blue-400 text-blue-300 shadow-[0_0_10px_rgba(59,130,246,0.3)]',
+  uk: 'bg-blue-700/30 border-blue-300 text-blue-200 shadow-[0_0_10px_rgba(96,165,250,0.3)]',
+  france: 'bg-indigo-600/30 border-indigo-400 text-indigo-300 shadow-[0_0_10px_rgba(129,140,248,0.3)]',
+  turkey: 'bg-teal-600/30 border-teal-400 text-teal-300 shadow-[0_0_10px_rgba(45,212,191,0.3)]',
+  saudi: 'bg-emerald-600/30 border-emerald-400 text-emerald-300 shadow-[0_0_10px_rgba(52,211,153,0.3)]',
+  uae: 'bg-emerald-600/30 border-emerald-400 text-emerald-300 shadow-[0_0_10px_rgba(52,211,153,0.3)]',
+  qatar: 'bg-emerald-600/30 border-emerald-400 text-emerald-300',
+  egypt: 'bg-amber-600/30 border-amber-400 text-amber-300 shadow-[0_0_10px_rgba(251,191,36,0.3)]',
+  jordan: 'bg-amber-600/30 border-amber-400 text-amber-300',
+  iraq: 'bg-amber-600/30 border-amber-400 text-amber-300',
+  iran: 'bg-red-600/30 border-red-400 text-red-300 shadow-[0_0_10px_rgba(239,68,68,0.3)]',
+  yemen: 'bg-red-600/30 border-red-400 text-red-300 shadow-[0_0_10px_rgba(239,68,68,0.3)]',
+  russia: 'bg-red-700/30 border-red-500 text-red-300 shadow-[0_0_10px_rgba(239,68,68,0.3)]',
+  china: 'bg-rose-600/30 border-rose-400 text-rose-300 shadow-[0_0_10px_rgba(244,63,94,0.3)]',
+  india: 'bg-orange-600/30 border-orange-400 text-orange-300 shadow-[0_0_10px_rgba(251,146,60,0.3)]',
+  neutral: 'bg-neutral-600/30 border-neutral-400 text-neutral-300',
+};
+
+const SUBMARINE_ICON = (
+  <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M4 14c0-3.3 2.7-6 6-6h4c3.3 0 6 2.7 6 6v0c0 1.1-.9 2-2 2H6c-1.1 0-2-.9-2-2v0z"/>
+    <circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/>
+    <path d="M12 8V5"/><path d="M10 5h4"/>
+    <path d="M4 19h16"/>
+  </svg>
+);
+
+const CARRIER_ICON = (
+  <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M2 16l3-1h14l3 1"/>
+    <path d="M5 15V11l2-3h10l2 3v4"/>
+    <path d="M7 8l10 0"/><path d="M9 8V5"/><path d="M12 8V4"/><path d="M15 8V5"/>
+    <path d="M2 20c1 0 2-1 3-1s2 1 3 1 2-1 3-1 2 1 3 1 2-1 3-1 2 1 3 1"/>
+  </svg>
+);
+
+const MILITARY_BOAT_ICON = (
+  <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M3 17l2-1h14l2 1"/><path d="M5 16V10l3-4h8l3 4v6"/>
+    <circle cx="12" cy="12" r="1.5"/>
+    <path d="M3 21c1 0 2-1 3-1s2 1 3 1 2-1 3-1 2 1 3 1 2-1 3-1 2 1 3 1"/>
+  </svg>
+);
+
+const BOAT_SVG_STRING = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 21c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1 .6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/><path d="M19.38 20A11.6 11.6 0 0 0 21 14l-9-4-9 4c0 2.2.9 4.3 2.5 6"/><path d="M12 10V4l-2-2"/></svg>`;
+
+const MAX_NAVAL_MARKERS = 300;
 
 export default function IntelMap({
   events,
@@ -314,11 +645,41 @@ export default function IntelMap({
   const animFrameRef = useRef<number | null>(null);
   const seenStrikeIds = useRef<Set<string>>(new Set());
 
-  // ─── HOVER STATES ───
+  // ─── MODAL STATES (click-to-open, click-outside-to-dismiss) ───
   const [hoveredVessel, setHoveredVessel] = useState<any>(null);
   const [hoveredAircraft, setHoveredAircraft] = useState<any>(null);
   const [hoveredSatellite, setHoveredSatellite] = useState<any>(null);
+  const [pinnedAsset, setPinnedAsset] = useState<(typeof STRATEGIC_ASSETS[0]) | null>(null);
   const [hoverPos, setHoverPos] = useState<{ x: number, y: number } | null>(null);
+  const justClickedMarker = useRef(false);
+
+  const clearAllTooltips = () => {
+    setHoveredVessel(null);
+    setHoveredAircraft(null);
+    setHoveredSatellite(null);
+    setPinnedAsset(null);
+  };
+
+  const pinVessel = (data: any, pos: { x: number, y: number }) => {
+    justClickedMarker.current = true;
+    clearAllTooltips();
+    setHoveredVessel(data);
+    setHoverPos(pos);
+  };
+
+  const pinAircraft = (data: any, pos: { x: number, y: number }) => {
+    justClickedMarker.current = true;
+    clearAllTooltips();
+    setHoveredAircraft(data);
+    setHoverPos(pos);
+  };
+
+  const pinSatellite = (data: any, pos: { x: number, y: number }) => {
+    justClickedMarker.current = true;
+    clearAllTooltips();
+    setHoveredSatellite(data);
+    setHoverPos(pos);
+  };
 
   // Detect new strike events and spawn trajectories
   useEffect(() => {
@@ -443,22 +804,12 @@ export default function IntelMap({
           return true;
        });
     }
-    // Cap markers to prevent GPU overload — prioritize high-severity and recent
-    if (locs.length > 200) {
-      locs.sort((a, b) => {
-        const sevOrder: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 };
-        const sevDiff = (sevOrder[b.severity] || 0) - (sevOrder[a.severity] || 0);
-        if (sevDiff !== 0) return sevDiff;
-        return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
-      });
-      locs = locs.slice(0, 200);
-    }
     return locs;
   }, [events, showAviation, showStrikes, showSatellite, showThermal, showSeismic, showWeather, showHumanitarian, showBoats, showMilitary, showCivilian, historicalFilterDays]);
 
   const flightLines = useMemo(() => {
     if (!showAviation) return { type: 'FeatureCollection', features: [] };
-    const aviationEvts = events.filter(e => e.type === 'aviation' && e.location).slice(0, 100);
+    const aviationEvts = events.filter(e => e.type === 'aviation' && e.location);
     return {
       type: 'FeatureCollection',
       features: aviationEvts.map(evt => {
@@ -504,8 +855,8 @@ export default function IntelMap({
         return showBases;
       }
       
-      // 3. Naval Filter (Carriers + Boats)
-      const isNavalType = asset.type === 'boat' || asset.type === 'carrier';
+      // 3. Naval Filter (Carriers + Boats + Submarines)
+      const isNavalType = asset.type === 'boat' || asset.type === 'carrier' || asset.type === 'submarine';
       if (isNavalType) {
         if (!showBoats) return false;
         
@@ -523,13 +874,7 @@ export default function IntelMap({
 
   const navalGeoJSON = useMemo(() => {
     if (!showBoats) return { type: 'FeatureCollection' as const, features: [] };
-    const filteredNavalEvents = events.filter(e => {
-      if (e.type !== 'naval' || !e.location) return false;
-      const isMil = e.entity?.isMilitary;
-      if (isMil && !showMilitary) return false;
-      if (!isMil && !showCivilian) return false;
-      return true;
-    });
+    const filteredNavalEvents = events.filter(e => e.type === 'naval' && e.location);
     return {
       type: 'FeatureCollection' as const,
       features: filteredNavalEvents.map(e => ({
@@ -548,31 +893,7 @@ export default function IntelMap({
         }
       }))
     };
-  }, [events, showBoats, showMilitary, showCivilian]);
-
-  const countryCasualties = useMemo(() => {
-    if (!showCasualties) return [];
-    const totals: Record<string, { lat: number, lng: number, count: number }> = {
-      'Israel': { lat: 31.4, lng: 34.9, count: 0 },
-      'Lebanon': { lat: 33.9, lng: 35.9, count: 0 },
-      'Syria': { lat: 34.8, lng: 38.9, count: 0 },
-      'Iraq': { lat: 33.2, lng: 43.6, count: 0 },
-      'Iran': { lat: 32.4, lng: 53.6, count: 0 },
-      'Yemen': { lat: 15.5, lng: 48.5, count: 0 },
-      'Palestine': { lat: 31.9, lng: 35.2, count: 0 }
-    };
-    let activeCutoff = 0;
-    if (historicalFilterDays > 0) activeCutoff = Date.now() - historicalFilterDays * 86400000;
-    events.forEach(e => {
-       if (e.fatalities && e.fatalities > 0) {
-          if (activeCutoff > 0 && new Date(e.timestamp).getTime() < activeCutoff) return;
-          Object.keys(totals).forEach(c => {
-             if (e.title.includes(c) || e.summary?.includes(c)) totals[c].count += e.fatalities!;
-          });
-       }
-    });
-    return Object.entries(totals).filter(([_, data]) => data.count > 0).map(([name, data]) => ({ name, ...data }));
-  }, [events, showCasualties, historicalFilterDays]);
+  }, [events, showBoats]);
 
   const heatmapGeoJSON = useMemo(() => {
     if (!showHeatmap) return { type: 'FeatureCollection' as const, features: [] };
@@ -591,6 +912,88 @@ export default function IntelMap({
       }))
     };
   }, [events, showHeatmap]);
+
+  // Memoized naval vessel list for boat Markers (capped at MAX_NAVAL_MARKERS)
+  const navalMarkerEvents = useMemo(() => {
+    if (!showBoats) return [];
+    return events.filter(e => {
+      if (e.type !== 'naval' || !e.location) return false;
+      if (e.entity?.isMilitary && !showMilitary) return false;
+      if (!e.entity?.isMilitary && !showCivilian) return false;
+      return true;
+    }).slice(0, MAX_NAVAL_MARKERS);
+  }, [events, showBoats, showMilitary, showCivilian]);
+
+  // Stable click handler for naval vessel markers (avoids closure per marker)
+  const handleVesselMarkerClick = useCallback((evt: IntelEvent, e: React.MouseEvent) => {
+    pinVessel({
+      name: evt.title,
+      mmsi: evt.entity?.mmsi,
+      callsign: evt.entity?.callsign,
+      speed: evt.entity?.speed,
+      destination: evt.entity?.destination,
+      isMilitary: evt.entity?.isMilitary,
+      source: evt.source,
+      sourceUrl: evt.sourceUrl,
+    }, { x: e.clientX, y: e.clientY });
+  }, []);
+
+  // Stable click handler for locatableEvents markers (avoids closure per marker)
+  const handleEventMarkerClick = useCallback((evt: IntelEvent, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (evt.type === 'aviation') {
+      pinAircraft({
+        icao24: evt.entity?.icao24 || evt.id.split('-')[1],
+        callsign: evt.entity?.callsign || evt.title,
+        type: evt.entity?.type,
+        country: evt.entity?.country,
+        origin: evt.entity?.origin,
+        destination: evt.entity?.destination,
+        sourceUrl: evt.sourceUrl,
+      }, { x: e.clientX, y: e.clientY });
+    } else if (evt.type === 'naval') {
+      pinVessel({
+        name: evt.entity?.callsign || evt.title,
+        mmsi: evt.entity?.mmsi,
+        callsign: evt.entity?.callsign,
+        speed: evt.entity?.speed,
+        destination: evt.entity?.destination,
+        isMilitary: evt.entity?.isMilitary,
+        source: evt.source,
+        sourceUrl: evt.sourceUrl,
+      }, { x: e.clientX, y: e.clientY });
+    } else {
+      pinSatellite({ ...evt }, { x: e.clientX, y: e.clientY });
+    }
+  }, []);
+
+  // Stable click handler for strategic asset markers
+  const handleAssetMarkerClick = useCallback((asset: typeof STRATEGIC_ASSETS[0], e: React.MouseEvent) => {
+    justClickedMarker.current = true;
+    clearAllTooltips();
+    setPinnedAsset(asset);
+    setHoverPos({ x: e.clientX, y: e.clientY });
+  }, []);
+
+  // Pre-compute type flags for locatableEvents to avoid per-render recalculation
+  const locatableEventsWithFlags = useMemo(() => {
+    return locatableEvents.map(evt => ({
+      evt,
+      isAviation: evt.type === 'aviation',
+      isNaval: evt.type === 'naval',
+      isSatelliteEvt: evt.type === 'satellite',
+      isConflict: evt.type === 'conflict',
+      isStrike: evt.type === 'strike',
+      isThermal: evt.type === 'thermal',
+      isSeismic: evt.type === 'seismic',
+      isWeather: evt.type === 'weather',
+      isHumanitarian: evt.type === 'humanitarian',
+      isNOTAM: evt.type === 'notam',
+      isNuclear: evt.type === 'nuclear',
+      hasCasualties: (evt.fatalities || 0) > 0,
+      isHighSeverity: evt.severity === 'high' || evt.severity === 'critical',
+    }));
+  }, [locatableEvents]);
 
   const [isSatellite, setIsSatellite] = useState(true);
 
@@ -623,34 +1026,33 @@ export default function IntelMap({
 
   const mapStyle = isSatellite ? MAP_STYLES.satellite : MAP_STYLES.dark;
 
-  const addVesselImage = (map: any) => {
-    const boatSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 21c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1 .6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/><path d="M19.38 20A11.6 11.6 0 0 0 21 14l-9-4-9 4c0 2.2.9 4.3 2.5 6"/><path d="M12 10V4l-2-2"/></svg>`;
-    const blob = new Blob([boatSvg], { type: 'image/svg+xml' });
-    const url = URL.createObjectURL(blob);
+  // Create the vessel SVG blob URL once and clean up on unmount
+  const vesselBlobUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    const blob = new Blob([BOAT_SVG_STRING], { type: 'image/svg+xml' });
+    vesselBlobUrlRef.current = URL.createObjectURL(blob);
+    return () => {
+      if (vesselBlobUrlRef.current) {
+        URL.revokeObjectURL(vesselBlobUrlRef.current);
+        vesselBlobUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  const addVesselImage = useCallback((map: any) => {
+    if (!vesselBlobUrlRef.current) return;
     const img = new Image();
     img.onload = () => { if (!map.hasImage('vessel')) map.addImage('vessel', img); };
-    img.src = url;
-  };
+    img.src = vesselBlobUrlRef.current;
+  }, []);
 
-  const onMapLoad = (e: any) => {
+  const onMapLoad = useCallback((e: any) => {
     const map = e.target;
     addVesselImage(map);
     // Re-add vessel image on style change (satellite ↔ dark)
     map.on('style.load', () => addVesselImage(map));
-  };
+  }, [addVesselImage]);
 
-  const handleMouseMove = (e: any) => {
-    // Prevent the background AIS layer from stealing hover from strategic markers
-    if (hoveredVessel && hoveredVessel.photoUrl) return;
-
-    const vessel = e.features && e.features[0];
-    if (vessel && (vessel.layer.id === 'vessel-unclustered')) {
-      setHoveredVessel(vessel.properties);
-      setHoverPos({ x: e.point.x, y: e.point.y });
-    } else {
-      setHoveredVessel(null);
-    }
-  };
 
   return (
     <div className="absolute inset-0 z-0 bg-neutral-950">
@@ -664,10 +1066,9 @@ export default function IntelMap({
           bearing: -10,
         }}
         mapStyle={mapStyle}
-        interactiveLayerIds={['vessel-unclustered']}
+        interactiveLayerIds={[]}
         onLoad={onMapLoad}
-        onMouseMove={handleMouseMove}
-        onMouseLeave={() => { if (!hoveredVessel?.photoUrl) setHoveredVessel(null); }}
+        onClick={() => { if (justClickedMarker.current) { justClickedMarker.current = false; return; } clearAllTooltips(); }}
       >
         <NavigationControl position="top-right" showCompass={false} />
 
@@ -677,7 +1078,7 @@ export default function IntelMap({
             id="nasa-gibs"
             type="raster"
             tiles={[
-              `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/${new Date().toISOString().split('T')[0]}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`
+              `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/${new Date(Date.now() - 2 * 86400000).toISOString().split('T')[0]}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`
             ]}
             tileSize={256}
             attribution="NASA GIBS / VIIRS"
@@ -722,13 +1123,23 @@ export default function IntelMap({
           <Layer id="missile-impact-shockwave" type="circle" paint={{ 'circle-radius': ['interpolate', ['linear'], ['get', 'elapsed'], 0, 10, 60000, 60], 'circle-color': '#f97316', 'circle-opacity': 0.25, 'circle-blur': 0.6, 'circle-stroke-width': 2, 'circle-stroke-color': '#ef4444', 'circle-stroke-opacity': 0.8 }} />
         </Source>
 
-        {showBoats && navalGeoJSON.features.length > 0 && (
-          <Source id="vessels" type="geojson" data={navalGeoJSON} cluster={true} clusterMaxZoom={8} clusterRadius={40}>
-            <Layer id="vessel-clusters" type="circle" filter={['has', 'point_count']} paint={{ 'circle-color': ['step', ['get', 'point_count'], '#334155', 20, '#1d4ed8', 80, '#1e3a5f'], 'circle-radius': ['step', ['get', 'point_count'], 12, 20, 18, 80, 24], 'circle-opacity': 0.85, 'circle-stroke-width': 1, 'circle-stroke-color': '#38bdf8', 'circle-stroke-opacity': 0.5 }} />
-            <Layer id="vessel-cluster-count" type="symbol" filter={['has', 'point_count']} layout={{ 'text-field': '{point_count_abbreviated}', 'text-font': ['Noto Sans Regular'], 'text-size': 10 }} paint={{ 'text-color': '#bae6fd' }} />
-            <Layer id="vessel-unclustered" type="symbol" filter={['!', ['has', 'point_count']]} layout={{ 'icon-image': 'vessel', 'icon-size': 0.5, 'icon-allow-overlap': true }} paint={{ 'icon-color': ['case', ['boolean', ['get', 'isMilitary'], false], '#1d4ed8', '#38bdf8'], 'icon-opacity': 0.9 }} />
-          </Source>
-        )}
+        {/* AIS vessels — rendered as direct React Markers (capped at MAX_NAVAL_MARKERS) */}
+        {navalMarkerEvents.map((evt) => (
+          <Marker key={evt.id} longitude={evt.location!.lng} latitude={evt.location!.lat} anchor="center">
+            <div
+              className="cursor-pointer"
+              onClick={(e) => handleVesselMarkerClick(evt, e)}
+            >
+              <div className={`flex items-center justify-center w-4 h-4 rounded-full border transition-transform hover:scale-150 ${
+                evt.entity?.isMilitary
+                  ? 'bg-blue-600/40 border-blue-400 text-blue-300'
+                  : 'bg-cyan-500/30 border-cyan-400/60 text-cyan-300'
+              }`}>
+                <Ship className="w-2.5 h-2.5" />
+              </div>
+            </div>
+          </Marker>
+        ))}
 
         {showAviation && flightLines.features && flightLines.features.length > 0 && (
           <Source id="trajectories" type="geojson" data={flightLines as any}>
@@ -737,39 +1148,23 @@ export default function IntelMap({
         )}
 
         {filteredAssets.map(asset => {
-          const isShip = asset.type === 'boat' || asset.type === 'carrier';
+          const isShip = asset.type === 'boat' || asset.type === 'carrier' || asset.type === 'submarine';
           const isMil = asset.faction !== 'neutral';
-          
-          let colorClass = 'bg-neutral-600/30 border-neutral-400 text-neutral-300';
-          if (asset.faction === 'us' || asset.faction === 'israel') {
-            colorClass = 'bg-blue-600/30 border-blue-400 text-blue-300 shadow-[0_0_10px_rgba(59,130,246,0.3)]';
-          } else if (asset.faction === 'iran' || asset.faction === 'yemen') {
-            colorClass = 'bg-red-600/30 border-red-400 text-red-300 shadow-[0_0_10px_rgba(239,68,68,0.3)]';
-          }
+          const colorClass = FACTION_COLOR_MAP[asset.faction] || FACTION_COLOR_MAP.neutral;
 
           return (
            <Marker key={asset.id} longitude={asset.lng} latitude={asset.lat} anchor="center">
-             <div 
+             <div
               className="group relative flex flex-col items-center cursor-pointer"
-              onMouseEnter={(e) => {
-                if (asset.mmsi || asset.photoUrl) {
-                  setHoveredVessel({
-                    name: asset.name,
-                    mmsi: asset.mmsi,
-                    photoUrl: asset.photoUrl,
-                    faction: asset.faction,
-                    isMilitary: asset.faction !== 'neutral',
-                    callsign: asset.id.toUpperCase(),
-                    destination: asset.description,
-                  });
-                  setHoverPos({ x: e.clientX, y: e.clientY });
-                }
-              }}
-              onMouseLeave={() => setHoveredVessel(null)}
+              onClick={(e) => handleAssetMarkerClick(asset, e)}
              >
                 <div className={`p-1 rounded-full border shadow-lg transition-transform hover:scale-125 ${colorClass}`}>
-                   {asset.type === 'base' ? <Shield className="w-5 h-5" /> : 
-                    isShip ? <Ship className="w-4 h-4" /> : <Anchor className="w-4 h-4" />}
+                   {asset.type === 'base' ? <Shield className="w-5 h-5" /> :
+                    asset.type === 'chokepoint' ? <Anchor className="w-4 h-4" /> :
+                    asset.type === 'submarine' ? SUBMARINE_ICON :
+                    asset.type === 'carrier' ? CARRIER_ICON :
+                    (isShip && !isMil) ? <AlertCircle className="w-4 h-4" /> :
+                    isShip ? MILITARY_BOAT_ICON : <Anchor className="w-4 h-4" />}
                 </div>
                 <div className="absolute top-full mt-1 px-2 py-0.5 bg-black/80 border border-white/10 rounded-sm text-[8px] font-bold tracking-tighter whitespace-nowrap opacity-0 group-hover:opacity-100 uppercase z-50">
                   {asset.name}
@@ -779,55 +1174,12 @@ export default function IntelMap({
           );
         })}
 
-        {locatableEvents.map((evt, idx) => {
-          const isAviation = evt.type === 'aviation';
-          const isNaval = evt.type === 'naval';
-          const isSatelliteEvt = evt.type === 'satellite';
-          const isConflict = evt.type === 'conflict';
-          const isStrike = evt.type === 'strike';
-          const isThermal = evt.type === 'thermal';
-          const isSeismic = evt.type === 'seismic';
-          const isWeather = evt.type === 'weather';
-          const isHumanitarian = evt.type === 'humanitarian';
-          const isNOTAM = evt.type === 'notam';
-          const isNuclear = evt.type === 'nuclear';
-          const hasCasualties = (evt.fatalities || 0) > 0;
-          const isHighSeverity = evt.severity === 'high' || evt.severity === 'critical';
-
+        {locatableEventsWithFlags.map(({ evt, isAviation, isNaval, isSatelliteEvt, isConflict, isStrike, isThermal, isSeismic, isWeather, isHumanitarian, isNOTAM, isNuclear, hasCasualties, isHighSeverity }, idx) => {
           return (
             <Marker key={`${evt.id}-${idx}`} longitude={evt.location!.lng} latitude={evt.location!.lat} anchor="center">
-              <div 
-                className="group relative"
-                onMouseEnter={(e) => {
-                  if (evt.type === 'aviation') {
-                    setHoveredAircraft({
-                      icao24: evt.entity?.icao24 || evt.id.split('-')[1],
-                      callsign: evt.entity?.callsign || evt.title,
-                      type: evt.entity?.type,
-                      country: evt.entity?.country
-                    });
-                    setHoverPos({ x: e.clientX, y: e.clientY });
-                  } else if (evt.type === 'naval') {
-                    setHoveredVessel({
-                      name: evt.entity?.callsign || evt.title,
-                      mmsi: evt.entity?.mmsi,
-                      callsign: evt.entity?.callsign,
-                      speed: evt.entity?.speed,
-                      destination: evt.entity?.destination,
-                      isMilitary: evt.entity?.isMilitary,
-                      source: evt.source,
-                    });
-                    setHoverPos({ x: e.clientX, y: e.clientY });
-                  } else if (evt.type === 'satellite' || evt.type === 'thermal' || evt.type === 'seismic' || evt.type === 'weather' || evt.type === 'humanitarian' || evt.type === 'notam' || evt.type === 'nuclear') {
-                    setHoveredSatellite(evt);
-                    setHoverPos({ x: e.clientX, y: e.clientY });
-                  }
-                }}
-                onMouseLeave={() => {
-                  setHoveredAircraft(null);
-                  setHoveredVessel(null);
-                  setHoveredSatellite(null);
-                }}
+              <div
+                className="group relative cursor-pointer"
+                onClick={(e) => handleEventMarkerClick(evt, e)}
               >
                 <div 
                   className={`flex items-center justify-center rounded-full border transition-all duration-300 ${
@@ -887,11 +1239,6 @@ export default function IntelMap({
                     <Radio className="w-3 h-3" />
                   )}
                 </div>
-                <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 hidden group-hover:block w-48 bg-neutral-900/90 backdrop-blur border border-neutral-700 p-2 rounded text-xs z-50 pointer-events-none text-neutral-200 shadow-xl">
-                  <div className="font-semibold text-white mb-1 uppercase tracking-tighter">{evt.entity?.callsign || evt.title}</div>
-                  <div className="opacity-70 line-clamp-2">{evt.summary}</div>
-                  <div className="mt-1 flex items-center justify-between opacity-50 text-[10px]"><span>{evt.source}</span><span>{formatDistanceToNow(new Date(evt.timestamp))} ago</span></div>
-                </div>
               </div>
             </Marker>
           );
@@ -899,7 +1246,7 @@ export default function IntelMap({
       </Map>
 
       {/* Map Style Toggle — outside <Map> so clicks aren't intercepted */}
-      <div className="absolute bottom-6 right-4 z-20 flex flex-col gap-2">
+      <div className="absolute bottom-20 md:bottom-6 right-4 z-20 flex flex-col gap-2">
         <button
           onClick={() => setShowGIBSLayer(!showGIBSLayer)}
           className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition shadow-lg backdrop-blur-md cursor-pointer ${
@@ -925,51 +1272,30 @@ export default function IntelMap({
       </div>
 
       {hoveredVessel && hoverPos && (
-        <div className="fixed z-[1000] pointer-events-none p-3 bg-black/90 backdrop-blur-md border border-white/10 rounded-lg shadow-2xl w-[260px] animate-in fade-in zoom-in duration-200" style={{ left: hoverPos.x + 15, top: hoverPos.y - 100 }}>
-          <div className="relative w-full h-[140px] bg-neutral-800 rounded mb-2 overflow-hidden border border-white/5">
-            {hoveredVessel.photoUrl || hoveredVessel.mmsi ? (
-              <img 
-                src={hoveredVessel.photoUrl ? hoveredVessel.photoUrl : `https://photos.marinetraffic.com/ais/showphoto.aspx?mmsi=${hoveredVessel.mmsi}`} 
-                className="w-full h-full object-cover" 
-                referrerPolicy="no-referrer"
-                onError={(e: any) => { e.target.onerror = null; e.target.src = "https://placehold.co/300x200/0a0a0a/666?text=SECURE+INTEL+FEED+ONLY"; }} 
-              />
-            ) : (<div className="w-full h-full flex items-center justify-center text-[10px] text-neutral-500 uppercase tracking-widest font-bold">No Photo Available</div>)}
-            <div className={`absolute top-2 right-2 px-1.5 py-0.5 bg-black/60 backdrop-blur border border-white/20 rounded text-[9px] font-bold flex items-center gap-1.5 ${hoveredVessel.isMilitary ? 'text-blue-400' : 'text-sky-400'}`}>
-              <FlagIcon countryCode={getCountryCode(hoveredVessel.faction || hoveredVessel.mmsi)} />
-              {hoveredVessel.isMilitary ? 'MILITARY' : 'CIVILIAN'}
-            </div>
-          </div>
-          <div className="space-y-1">
-            <h3 className="text-white font-bold uppercase tracking-tight text-sm truncate">{hoveredVessel.name || 'UNKNOWN VESSEL'}</h3>
-            <div className="grid grid-cols-2 gap-2 text-[10px]">
-              <div><span className="opacity-40 uppercase block text-[8px]">Callsign</span><span className="text-blue-300 font-mono">{hoveredVessel.callsign || 'N/A'}</span></div>
-              <div><span className="opacity-40 uppercase block text-[8px]">Destination</span><span className="text-emerald-400 truncate block">{hoveredVessel.destination || 'OPEN SEA'}</span></div>
-              <div><span className="opacity-40 uppercase block text-[8px]">Speed</span><span className="text-amber-400">{hoveredVessel.speed ? `${hoveredVessel.speed} kn` : '0 kn'}</span></div>
-              <div><span className="opacity-40 uppercase block text-[8px]">MMSI</span><span className="text-neutral-500 font-mono">{hoveredVessel.mmsi || 'N/A'}</span></div>
-            </div>
-          </div>
-          <div className="mt-3 pt-2 border-t border-white/5 flex items-center gap-1.5 opacity-30"><Radio className="w-3 h-3 text-sky-400" /><span className="text-[8px] uppercase font-bold tracking-widest">Live Sat-AIS Telemetry</span></div>
-        </div>
+        <VesselModal vessel={hoveredVessel} pos={hoverPos} onClose={clearAllTooltips} />
       )}
       {hoveredAircraft && hoverPos && (
-        <AircraftTooltip 
-          icao24={hoveredAircraft.icao24} 
-          callsign={hoveredAircraft.callsign} 
-          type={hoveredAircraft.type} 
+        <AircraftTooltip
+          icao24={hoveredAircraft.icao24}
+          callsign={hoveredAircraft.callsign}
+          type={hoveredAircraft.type}
           country={hoveredAircraft.country}
-           pos={hoverPos} 
+          origin={hoveredAircraft.origin}
+          destination={hoveredAircraft.destination}
+          sourceUrl={hoveredAircraft.sourceUrl}
+          pos={hoverPos}
+          onClose={clearAllTooltips}
         />
       )}
       {hoveredSatellite && hoverPos && (
-        <SatelliteTooltip 
-          title={hoveredSatellite.title}
-          summary={hoveredSatellite.summary}
-          imageUrl={hoveredSatellite.payloadImage}
-          source={hoveredSatellite.source}
-          timestamp={hoveredSatellite.timestamp}
+        <EventTooltip
+          evt={hoveredSatellite}
           pos={hoverPos}
+          onClose={clearAllTooltips}
         />
+      )}
+      {pinnedAsset && hoverPos && (
+        <AssetModal asset={pinnedAsset} pos={hoverPos} onClose={clearAllTooltips} />
       )}
     </div>
   );

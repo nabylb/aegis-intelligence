@@ -26,7 +26,32 @@
       "Bash(python3 -c \":*)",
       "Bash(curl -s \"https://data-cloud.flightradar24.com/zones/fcgi/feed.js?bounds=40.00,12.00,33.00,63.00&faa=1&satellite=1&mlat=1&flarm=1&adsb=1&gnd=0&air=1&vehicles=0&estimated=1&maxage=14400&gliders=0&stats=0\" -H \"User-Agent: Mozilla/5.0 \\(Macintosh; Intel Mac OS X 10_15_7\\) AppleWebKit/537.36\" -H \"Accept: application/json\")",
       "Bash(curl -s \"https://raw.githubusercontent.com/jpatokal/openflights/master/data/airlines.dat\")",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(curl -s \"http://localhost:3000/api/stream\")",
+      "Bash(git stash:*)",
+      "Bash(curl -s \"https://api.acleddata.com/acled/read?event_date=2024-01-01|2025-12-31&event_date_where=BETWEEN&region=11&fields=fatalities|country|event_date&limit=1\")",
+      "Bash(curl -s \"https://api.reliefweb.int/v1/reports?appname=aegis&filter[field]=country.name&filter[value][]=occupied+palestinian+territory&filter[value][]=Israel&filter[value][]=Lebanon&filter[value][]=Syria&filter[value][]=Yemen&filter[value][]=Iraq&fields[include][]=title&fields[include][]=url&fields[include][]=date.created&fields[include][]=source.name&limit=5&sort[]=date.created:desc\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" -L \"https://upload.wikimedia.org/wikipedia/commons/5/52/USS_Gerald_R._Ford_%28CVN-78%29_underway_in_the_Atlantic_Ocean_on_8_April_2017.jpg\" --max-time 5)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" -L \"https://upload.wikimedia.org/wikipedia/commons/5/5a/USS_Colorado_%28SSN-788%29_Returns_to_Homeport_200716-N-DX615-1005.jpg\" --max-time 5)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" -L \"https://upload.wikimedia.org/wikipedia/commons/e/ec/IRIS_Sahand_2.JPG\" --max-time 5)",
+      "Bash(curl -s \"https://data.humdata.org/api/3/action/package_search?q=casualties+gaza&rows=5\")",
+      "WebFetch(domain:data.humdata.org)",
+      "WebFetch(domain:airwars.org)",
+      "WebFetch(domain:yemendataproject.org)",
+      "WebFetch(domain:www.iraqbodycount.org)",
+      "WebFetch(domain:ucdp.uu.se)",
+      "WebFetch(domain:data.techforpalestine.org)",
+      "WebFetch(domain:hdx-hapi.readthedocs.io)",
+      "WebFetch(domain:www.ochaopt.org)",
+      "Bash(curl -s \"https://data.techforpalestine.org/api/v3/summary.min.json\")",
+      "Bash(curl -s \"https://ucdpapi.pcr.uu.se/api/battledeaths?pagesize=1\")",
+      "Bash(curl -s \"https://hdx-hapi.readthedocs.io/en/latest/data_usage_guides/coordination_and_context/\")",
+      "Bash(curl -s \"https://hapi.humdata.org/api/v2/coordination-context/conflict-events?location_code=PSE&output_format=json&app_identifier=aegis-test&limit=3\")",
+      "Bash(curl -s \"https://api.reliefweb.int/v1/reports?appname=aegis&filter[field]=title&filter[value]=casualt*&filter[field]=country.name&filter[value]=occupied+palestinian+territory&fields[include][]=title&fields[include][]=body&limit=2&sort[]=date.created:desc\")",
+      "Bash(curl -s \"https://hapi.humdata.org/api/v2/coordination-context/conflict-events?location_code=PSE&output_format=json&app_identifier=YWVnaXM6bmFieWxiQHppbWJsZWZ5LmNvbQ&limit=3\")",
+      "Bash(curl -s \"https://hapi.humdata.org/api/v2/coordination-context/conflict-events?location_code=PSE&output_format=json&limit=3\")",
+      "Bash(curl -s \"https://hapi.humdata.org/api/v2/metadata/admin1?location_code=PSE&limit=3\")",
+      "WebFetch(domain:centre.humdata.org)"
     ]
   }
 }

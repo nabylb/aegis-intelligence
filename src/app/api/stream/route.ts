@@ -1,7 +1,8 @@
-import { fetchGDELTData, fetchGDELTGeoData, fetchRSSFeeds, fetchOpenSkyData, fetchACLEDData, fetchThinkTankAnalysis, fetchGlobalAISData, fetchTzevaAdomAlerts, fetchOSINTFeeds, fetchXFeeds, fetchSatelliteOSINT, fetchNASAFIRMS, fetchUSGSEarthquakes, fetchWeatherData, fetchReliefWebData, fetchNOTAMData, fetchIAEAData, fetchTelegramOSINT, fetchLiveuamapData } from '@/lib/aggregator';
+import { fetchGDELTData, fetchGDELTGeoData, fetchRSSFeeds, fetchOpenSkyData, fetchACLEDData, fetchThinkTankAnalysis, fetchGlobalAISData, fetchTzevaAdomAlerts, fetchOSINTFeeds, fetchXFeeds, fetchSatelliteOSINT, fetchNASAFIRMS, fetchUSGSEarthquakes, fetchWeatherData, fetchReliefWebData, fetchNOTAMData, fetchIAEAData, fetchTelegramOSINT, fetchLiveuamapData, fetchCasualtyAggregates } from '@/lib/aggregator';
 import { IntelEvent } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60; // Vercel Pro max
 
 // ─── LEVENSHTEIN DISTANCE (two-row DP, O(min(m,n)) space) ───────────────────
 function levenshteinDistance(a: string, b: string): number {
@@ -28,8 +29,9 @@ function normalizeTitle(title: string): string {
 }
 
 // ─── SHARED SERVER-SIDE CACHE ────────────────────────────────────────────────
-// Single aggregated event store, shared across all SSE connections.
-// Each fetcher has its own in-memory cache, so calling them is cheap when cached.
+// NOTE: On Vercel serverless, this cache lives per-instance and resets on cold starts.
+// Each fetcher in aggregator.ts also has its own in-memory cache with TTLs,
+// so repeated calls within the same instance lifetime are cheap.
 let masterEvents: IntelEvent[] = [];
 let masterEventIds = new Set<string>();
 let titleIndex = new Map<string, string>(); // normalized title fragment -> event ID
@@ -67,11 +69,14 @@ async function fetchSlowTier(): Promise<IntelEvent[]> {
     fetchNOTAMData(),
     fetchIAEAData(),
     fetchLiveuamapData(),
+    fetchCasualtyAggregates(),
   ]);
   return results.flatMap(r => r.status === 'fulfilled' ? r.value : []);
 }
 
-// Initialize: fetch everything once, build master store
+// Initialize: fetch everything once, build master store.
+// Both tiers run in parallel via Promise.allSettled so no single slow
+// fetcher blocks the others. maxDuration=60 covers Vercel Pro.
 async function initialize() {
   if (isInitialized) return;
   if (initPromise) { await initPromise; return; }
@@ -79,7 +84,7 @@ async function initialize() {
   initPromise = (async () => {
     const [fast, slow] = await Promise.all([fetchFastTier(), fetchSlowTier()]);
     const all = [...fast, ...slow];
-    masterEvents = dedup(all);
+    masterEvents = dedupEvents(all);
     masterEventIds = new Set(masterEvents.map(e => e.id));
     titleIndex = new Map();
     for (const e of masterEvents) {
@@ -144,7 +149,7 @@ function mergeAndGetDelta(incoming: IntelEvent[]): IntelEvent[] {
   return newEvents;
 }
 
-function dedup(arr: IntelEvent[]): IntelEvent[] {
+function dedupEvents(arr: IntelEvent[]): IntelEvent[] {
   const seen = new Map<string, IntelEvent>();
   for (const e of arr) {
     if (e?.id && typeof e.id === 'string') seen.set(e.id, e);
@@ -154,58 +159,50 @@ function dedup(arr: IntelEvent[]): IntelEvent[] {
   );
 }
 
+// ─── POLLING REST API ────────────────────────────────────────────────────────
+// Client polls this endpoint every ~30s.
+// - First call (no ?since param): returns full event list
+// - Subsequent calls (?since=<timestamp>): refreshes fast tier, returns delta only
 export async function GET(req: Request) {
-  const encoder = new TextEncoder();
+  const url = new URL(req.url);
+  const sinceParam = url.searchParams.get('since');
+  const now = Date.now();
 
-  const stream = new ReadableStream({
-    async start(controller) {
-      const send = (data: any) => {
-        if (!req.signal.aborted) {
-          try {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
-          } catch { /* connection closed */ }
-        }
-      };
+  // Initialize master store on first request (shared within this serverless instance)
+  await initialize();
 
-      send({ type: 'connected' });
-
-      // Initialize master store (shared across connections — fast if already done)
-      await initialize();
-
-      // Send full initial payload
-      send({ type: 'init', events: masterEvents });
-
-      // Fast poll: 30s for real-time data
-      const fastInterval = setInterval(async () => {
-        try {
-          const incoming = await fetchFastTier();
-          const delta = mergeAndGetDelta(incoming);
-          if (delta.length > 0) send({ type: 'update', events: delta });
-        } catch (err) { console.error('[SSE] Fast tick error:', err); }
-      }, 30000);
-
-      // Slow poll: 5 min for heavy data
-      const slowInterval = setInterval(async () => {
-        try {
-          const incoming = await fetchSlowTier();
-          const delta = mergeAndGetDelta(incoming);
-          if (delta.length > 0) send({ type: 'update', events: delta });
-        } catch (err) { console.error('[SSE] Slow tick error:', err); }
-      }, 300000);
-
-      // Cleanup on disconnect
-      req.signal.addEventListener('abort', () => {
-        clearInterval(fastInterval);
-        clearInterval(slowInterval);
-      });
+  // If `since` is provided, this is a poll — refresh and return updates
+  if (sinceParam) {
+    // Refresh fast tier on poll
+    if (now - lastFastFetch > 25000) {
+      try {
+        const incoming = await fetchFastTier();
+        mergeAndGetDelta(incoming);
+        lastFastFetch = now;
+      } catch (err) { console.error('[Poll] Fast tier error:', err); }
     }
-  });
 
-  return new Response(stream, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache, no-transform',
-      'Connection': 'keep-alive',
-    },
+    // Refresh slow tier if 5+ minutes since last
+    if (now - lastFullFetch > 300000) {
+      try {
+        const incoming = await fetchSlowTier();
+        mergeAndGetDelta(incoming);
+        lastFullFetch = now;
+      } catch (err) { console.error('[Poll] Slow tier error:', err); }
+    }
+
+    // Return full event list — client deduplicates
+    return Response.json({
+      type: 'update',
+      events: masterEvents,
+      serverTime: now,
+    });
+  }
+
+  // First request — return full payload
+  return Response.json({
+    type: 'init',
+    events: masterEvents,
+    serverTime: now,
   });
 }

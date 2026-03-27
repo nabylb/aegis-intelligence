@@ -637,13 +637,30 @@ function parseGDELTExportCSV(csvText: string, exportTimestamp?: string): IntelEv
       if (cols.length < 61) continue;
 
       const eventCode = cols[26] || '';
-      // Filter: Only actual kinetic/military strike codes
-      // 183=Armed attack, 184=Assassination, 185=Chem/bio, 186=Suicide bomb
-      // 190=Military force, 193=Small arms, 194=Artillery/missiles, 195=Aerial weapons
-      // 196=Ceasefire violation, 200+=Mass violence
-      // Exclude: 180(generic), 181(abduction), 182(assault), 191(blockade), 192(occupy)
-      const KINETIC_CODES = ['183','184','185','186','190','193','194','195','196','200','201','202','203'];
+      const quadClass = cols[29] || '';  // GDELT Events 2.0: col29 = QuadClass (1-4)
+      const numMentions = parseInt(cols[31]) || 0;  // col31 = NumMentions
+
+      // Filter: Only ACTUAL kinetic events, not articles that merely discuss military topics.
+      // GDELT codes articles by topic — an article about peace negotiations that mentions
+      // "military force" gets coded 190. We need to be strict:
+      // 1. Only QuadClass=4 (Material Conflict = actual events, not verbal threats/statements)
+      // 2. Only specific kinetic CAMEO codes (exclude generic "use of force" 190 which is noisy)
+      // 3. Require multiple source mentions to filter out mis-coded single-source articles
+      //
+      // Codes kept: 183=Armed attack, 184=Assassination, 185=Chem/bio, 186=Suicide bomb
+      //             193=Fight with small arms, 194=Artillery/missiles, 195=Aerial weapons
+      //             196=Ceasefire violation, 200+=Mass violence
+      // Codes REMOVED: 190 (generic "use of conventional military force" — too noisy, catches
+      //                articles about diplomacy, defense policy, military exercises, etc.)
+      const KINETIC_CODES = ['183','184','185','186','193','194','195','196','200','201','202','203'];
       if (!KINETIC_CODES.includes(eventCode)) continue;
+
+      // QuadClass 4 = Material Conflict (actual physical events)
+      // QuadClass 3 = Verbal Conflict (threats, statements, demands — NOT strikes)
+      if (quadClass !== '4') continue;
+
+      // Require at least 2 source mentions to reduce single-source mis-codings
+      if (numMentions < 2) continue;
 
       const lat = parseFloat(cols[56]);
       const lng = parseFloat(cols[57]);
@@ -657,7 +674,7 @@ function parseGDELTExportCSV(csvText: string, exportTimestamp?: string): IntelEv
       const actor1 = cols[6] || '';
       const actor2 = cols[16] || '';
       const sourceUrl = cols[60] || '';
-      const goldstein = parseFloat(cols[30]) || 0;
+      const goldstein = parseFloat(cols[30]) || 0;  // col30 = GoldsteinScale
       const dateStr = cols[1] || '';
 
       // Build a searchable string for strategic scoring
@@ -739,24 +756,18 @@ async function decompressGDELTZip(zipBuffer: Buffer): Promise<string | null> {
 // CAMEO event code to human-readable label
 function getCameoLabel(code: string): string {
   const labels: Record<string, string> = {
-    '180': 'Use of conventional military force',
-    '181': 'Abduction/hijacking',
-    '182': 'Physical assault',
-    '183': 'Armed attack',
+    '183': 'Armed Attack',
     '184': 'Assassination',
-    '185': 'Chemical/biological attack',
-    '186': 'Suicide bombing',
-    '190': 'Use of conventional military force',
-    '191': 'Impose blockade',
-    '192': 'Occupy territory',
-    '193': 'Fight with small arms',
-    '194': 'Fight with artillery/tanks',
-    '195': 'Employ aerial weapons',
-    '196': 'Violate ceasefire',
-    '200': 'Use of unconventional mass violence',
-    '201': 'Conduct mass expulsion',
-    '202': 'Conduct ethnic cleansing',
-    '203': 'Use of weapons of mass destruction',
+    '185': 'Chemical/Biological Attack',
+    '186': 'Suicide Bombing',
+    '193': 'Small Arms Fire',
+    '194': 'Artillery / Missile Strike',
+    '195': 'Airstrike',
+    '196': 'Ceasefire Violation',
+    '200': 'Mass Violence',
+    '201': 'Mass Expulsion',
+    '202': 'Ethnic Cleansing',
+    '203': 'WMD Use',
   };
   return labels[code] || `Military action (${code})`;
 }
@@ -924,8 +935,14 @@ export async function fetchXFeeds(): Promise<IntelEvent[]> {
   return allEvents;
 }
 
-// ─── AVIATION (FlightRadar24) ──────────────────────────────────────────────────
-// Unthrottled FlightRadar24 data feed for Middle East bounding box
+// ─── AVIATION (OpenSky Network + FlightRadar24 merged) ───────────────────────
+// Both sources are fetched in parallel and merged by ICAO24 hex code.
+// OpenSky: reliable from cloud IPs, basic ADS-B fields (position, speed, altitude).
+// FR24: richer data (aircraft type, airline, origin/dest, registration) but may be
+//       blocked from data-center IPs. Works locally and sometimes from edge/CDN.
+// Strategy: fetch both, deduplicate by icao24, prefer FR24 fields when available
+//           since it provides aircraft type, route, and registration data.
+//           FR24 also picks up additional military flights via MLAT/FLARM sensors.
 let cachedOpenSkyEvents: IntelEvent[] = [];
 let lastOpenSkyFetch: number = 0;
 const OPENSKY_CACHE_TTL = 30 * 1000; // 30-second cache
@@ -935,43 +952,168 @@ export async function fetchOpenSkyData(): Promise<IntelEvent[]> {
     return cachedOpenSkyEvents;
   }
 
+  // Fetch both sources in parallel
+  const [openSkyResults, fr24Results] = await Promise.allSettled([
+    fetchFromOpenSky(),
+    fetchFromFR24(),
+  ]);
+
+  const openSkyEvents = openSkyResults.status === 'fulfilled' ? openSkyResults.value : [];
+  const fr24Events = fr24Results.status === 'fulfilled' ? fr24Results.value : [];
+
+  // Merge: index FR24 by icao24 for enrichment, then combine
+  const fr24ByIcao = new Map<string, IntelEvent>();
+  const fr24OnlyEvents: IntelEvent[] = [];
+
+  for (const evt of fr24Events) {
+    const icao = evt.entity?.icao24?.toLowerCase();
+    if (icao) {
+      fr24ByIcao.set(icao, evt);
+    }
+  }
+
+  const mergedByIcao = new Set<string>();
+  const merged: IntelEvent[] = [];
+
+  // Start with OpenSky events, enrich with FR24 data where available
+  for (const evt of openSkyEvents) {
+    const icao = evt.entity?.icao24?.toLowerCase() || '';
+    const fr24Match = icao ? fr24ByIcao.get(icao) : undefined;
+
+    if (fr24Match) {
+      // FR24 has richer data — use it but keep OpenSky position if FR24 position is missing
+      const enriched: IntelEvent = {
+        ...fr24Match,
+        id: evt.id, // keep consistent ID
+        location: fr24Match.location || evt.location,
+        entity: {
+          ...evt.entity,
+          ...fr24Match.entity,
+          // Prefer FR24 fields but keep OpenSky position data as fallback
+          heading: fr24Match.entity?.heading ?? evt.entity?.heading,
+          altitude: fr24Match.entity?.altitude ?? evt.entity?.altitude,
+          speed: fr24Match.entity?.speed ?? evt.entity?.speed,
+        },
+        source: 'Aviation Transponder (ADS-B + FR24)',
+      };
+      merged.push(enriched);
+      mergedByIcao.add(icao);
+    } else {
+      merged.push(evt);
+    }
+  }
+
+  // Add FR24-only flights (military MLAT/FLARM not in OpenSky)
+  for (const evt of fr24Events) {
+    const icao = evt.entity?.icao24?.toLowerCase() || '';
+    if (icao && !mergedByIcao.has(icao)) {
+      merged.push({ ...evt, source: 'Aviation Transponder (FR24)' });
+    }
+  }
+
+  const events = merged.length > 0 ? merged : openSkyEvents.length > 0 ? openSkyEvents : fr24Events;
+
+  if (events.length > 0) {
+    cachedOpenSkyEvents = events;
+    lastOpenSkyFetch = Date.now();
+  }
+  return cachedOpenSkyEvents;
+}
+
+async function fetchFromOpenSky(): Promise<IntelEvent[]> {
   const events: IntelEvent[] = [];
   try {
-    // Top-left to bottom-right bounding box precisely centered on Iran, Persian Gulf, and Levant
-    // North: 40.00 (Turkey/Caspian), South: 12.00 (Gulf of Aden), West: 33.00 (Israel/Med), East: 63.00 (Iran/Pakistan border)
-    const bounds = "40.00,12.00,33.00,63.00"; 
+    // Bounding box: South 12°, North 40°, West 33°, East 63° (Middle East + Persian Gulf)
+    const url = 'https://opensky-network.org/api/states/all?lamin=12&lomin=33&lamax=40&lomax=63';
+    const response = await fetch(url, {
+      headers: { 'Accept': 'application/json' },
+      cache: 'no-store',
+      signal: AbortSignal.timeout(15000),
+    }).catch(err => {
+      console.error('[OpenSky] Network fetch failed:', err.message);
+      return null;
+    });
+
+    if (!response || !response.ok) return [];
+    const data = await response.json().catch(() => null);
+    if (!data?.states || !Array.isArray(data.states)) return [];
+
+    // OpenSky state vector indices:
+    //  0: icao24, 1: callsign, 2: origin_country, 3: time_position
+    //  5: longitude, 6: latitude, 7: baro_altitude, 8: on_ground
+    //  9: velocity (m/s), 10: true_track (heading)
+    // Take up to 300 aircraft — no random sampling so military flights aren't dropped
+    const sampled = data.states.slice(0, 300);
+
+    for (const s of sampled) {
+      const lat = s[6];
+      const lng = s[5];
+      if (lat == null || lng == null || s[8] === true) continue; // skip grounded
+
+      const callsign = (s[1] || '').trim();
+      const icao24 = s[0] || '';
+      const country = s[2] || '';
+      const altitude = s[7] != null ? Math.round(s[7] * 3.281) : undefined; // m → ft
+      const speed = s[9] != null ? Math.round(s[9] * 1.944) : undefined; // m/s → knots
+      const heading = s[10] ?? 0;
+
+      events.push({
+        id: `flight-${icao24}-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        title: callsign || `ICAO ${icao24}`,
+        summary: [
+          country && `Origin: ${country}`,
+          altitude != null && `FL${Math.round(altitude / 100)}`,
+          speed != null && `${speed} kts`,
+        ].filter(Boolean).join(' | '),
+        source: 'Aviation Transponder',
+        type: 'aviation',
+        severity: 'low',
+        location: { lat, lng },
+        entity: {
+          callsign,
+          icao24,
+          heading,
+          altitude,
+          speed,
+          country,
+        }
+      });
+    }
+  } catch (err) {
+    console.error('[OpenSky] Processing failed:', err);
+  }
+  return events;
+}
+
+async function fetchFromFR24(): Promise<IntelEvent[]> {
+  const events: IntelEvent[] = [];
+  try {
+    const bounds = "40.00,12.00,33.00,63.00";
     const url = `https://data-cloud.flightradar24.com/zones/fcgi/feed.js?bounds=${bounds}&faa=1&satellite=1&mlat=1&flarm=1&adsb=1&gnd=0&air=1&vehicles=0&estimated=1&maxage=14400&gliders=0&stats=0`;
-    
-    const response = await fetch(url, { 
-      headers: { 
+
+    const response = await fetch(url, {
+      headers: {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json'
       },
-      cache: 'no-store' 
+      cache: 'no-store',
+      signal: AbortSignal.timeout(10000),
     }).catch(err => {
       console.error('[FR24 Aviation] Network fetch failed:', err.message);
       return null;
     });
-    
-    if (!response || !response.ok) return cachedOpenSkyEvents;
-    const data = await response.json().catch(() => null);
-    if (!data) return cachedOpenSkyEvents;
 
-    let count = 0;
-    // FR24 JSON keys are flight IDs, values are arrays of flight data
-    // We shuffle or sample to ensure we get planes across the whole region, not just the first 100 parsing Left-to-Right
+    if (!response || !response.ok) return [];
+    const data = await response.json().catch(() => null);
+    if (!data) return [];
+
     const flightEntries = Object.entries(data).filter(([key]) => key !== 'full_count' && key !== 'version');
-    
-    // Sort randomly to ensure a geographic spread if there are >150 flights (FR24 returns thousands)
-    const sampledFlights = flightEntries.sort(() => 0.5 - Math.random()).slice(0, 150);
+    // Take up to 300 flights — no random sampling so military flights aren't dropped
+    const sampledFlights = flightEntries.slice(0, 300);
 
     for (const [key, flight] of sampledFlights) {
       const f = flight as any[];
-      // FR24 array indices:
-      //  0: ICAO24 Hex, 1: Lat, 2: Lng, 3: Heading, 4: Altitude(ft), 5: Speed(kts)
-      //  8: Aircraft Type (B789, A20N, etc), 9: Registration (4X-EDD)
-      // 11: Origin IATA, 12: Dest IATA, 13: Flight Number (LY834)
-      // 16: Callsign (ELY834), 18: Airline ICAO Code (ELY)
       const callsign = f[16] || f[13] || '';
       const flightNum = f[13] || '';
       const registration = f[9] || '';
@@ -1001,7 +1143,7 @@ export async function fetchOpenSkyData(): Promise<IntelEvent[]> {
           heading: f[3],
           altitude: f[4],
           speed: f[5],
-          country: registration, // Registration prefix indicates country
+          country: registration,
           origin,
           destination,
         }
@@ -1009,11 +1151,8 @@ export async function fetchOpenSkyData(): Promise<IntelEvent[]> {
     }
   } catch (err) {
     console.error('[FR24 Aviation] Processing failed:', err);
-    return cachedOpenSkyEvents;
   }
-  cachedOpenSkyEvents = events;
-  lastOpenSkyFetch = Date.now();
-  return cachedOpenSkyEvents;
+  return events;
 }
 
 // ─── GLOBAL AIS (Open Source Snapshot) ─────────────────────────────────────────
@@ -2021,4 +2160,107 @@ export async function fetchLiveuamapData(): Promise<IntelEvent[]> {
   }
 
   return cachedLiveuamapEvents.length > 0 ? cachedLiveuamapEvents : events;
+}
+
+// ─── CASUALTY AGGREGATES (Tech for Palestine + ACLED summary) ─────────────────
+// Fetches aggregate casualty totals from structured APIs once per day.
+// Tech for Palestine: Gaza + West Bank daily totals (zero auth, JSON).
+// These are displayed as high-severity conflict events with running totals.
+
+export interface CasualtyAggregate {
+  region: string;
+  killed: number;
+  injured: number;
+  children?: number;
+  women?: number;
+  lastUpdate: string;
+  source: string;
+  sourceUrl: string;
+}
+
+let cachedCasualtyAggregates: CasualtyAggregate[] = [];
+let lastCasualtyFetch: number = 0;
+const CASUALTY_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+export async function fetchCasualtyAggregates(): Promise<IntelEvent[]> {
+  if (Date.now() - lastCasualtyFetch < CASUALTY_CACHE_TTL && cachedCasualtyAggregates.length > 0) {
+    return casualtyAggregatesToEvents(cachedCasualtyAggregates);
+  }
+
+  const aggregates: CasualtyAggregate[] = [];
+
+  // ── Tech for Palestine: Gaza + West Bank summary ──
+  try {
+    const res = await fetch('https://data.techforpalestine.org/api/v3/summary.min.json', {
+      signal: AbortSignal.timeout(10000),
+      headers: { 'Accept': 'application/json' },
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const gaza = data?.gaza;
+      const wb = data?.west_bank;
+
+      if (gaza) {
+        aggregates.push({
+          region: 'Gaza',
+          killed: gaza.killed?.total ?? 0,
+          injured: gaza.injured?.total ?? 0,
+          children: gaza.killed?.children ?? undefined,
+          women: gaza.killed?.women ?? undefined,
+          lastUpdate: gaza.last_update || new Date().toISOString(),
+          source: 'Tech for Palestine / MoH Gaza',
+          sourceUrl: 'https://data.techforpalestine.org/docs/summary/',
+        });
+      }
+      if (wb) {
+        aggregates.push({
+          region: 'West Bank',
+          killed: wb.killed?.total ?? 0,
+          injured: wb.injured?.total ?? 0,
+          children: wb.killed?.children ?? undefined,
+          women: wb.killed?.women ?? undefined,
+          lastUpdate: wb.last_update || new Date().toISOString(),
+          source: 'Tech for Palestine / MoH West Bank',
+          sourceUrl: 'https://data.techforpalestine.org/docs/summary/',
+        });
+      }
+    }
+  } catch (err) {
+    console.error('[CasualtyAggregates] Tech for Palestine fetch failed:', err);
+  }
+
+  if (aggregates.length > 0) {
+    cachedCasualtyAggregates = aggregates;
+    lastCasualtyFetch = Date.now();
+  }
+  return casualtyAggregatesToEvents(cachedCasualtyAggregates);
+}
+
+function casualtyAggregatesToEvents(aggregates: CasualtyAggregate[]): IntelEvent[] {
+  return aggregates.map(a => {
+    const details = [
+      `${a.killed.toLocaleString()} killed`,
+      `${a.injured.toLocaleString()} injured`,
+      a.children ? `${a.children.toLocaleString()} children killed` : '',
+      a.women ? `${a.women.toLocaleString()} women killed` : '',
+    ].filter(Boolean).join(' | ');
+
+    return {
+      id: `casualty-agg-${a.region.toLowerCase().replace(/\s+/g, '-')}`,
+      timestamp: a.lastUpdate,
+      title: `${a.region} Cumulative Casualties: ${a.killed.toLocaleString()} killed`,
+      summary: details,
+      source: a.source,
+      sourceUrl: a.sourceUrl,
+      type: 'conflict' as const,
+      severity: 'critical' as IntelSeverity,
+      strategicScore: 10,
+      fatalities: a.killed,
+      location: a.region === 'Gaza'
+        ? { lat: 31.4, lng: 34.35, name: 'Gaza Strip' }
+        : a.region === 'West Bank'
+        ? { lat: 31.9, lng: 35.2, name: 'West Bank' }
+        : undefined,
+    };
+  });
 }
