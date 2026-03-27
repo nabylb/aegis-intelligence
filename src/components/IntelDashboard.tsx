@@ -63,6 +63,13 @@ export default function IntelDashboard() {
     });
   }, []);
 
+  // ─── Browser notification permission ───────────────────────────────────────
+  useEffect(() => {
+    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  }, []);
+
   // ─── Hydrate cache ─────────────────────────────────────────────────────────
   useEffect(() => {
     try {
@@ -145,6 +152,15 @@ export default function IntelDashboard() {
           const newHist = [candidate, ...historic].slice(0, 50);
           try { localStorage.setItem('aegis-breaking-history', JSON.stringify(newHist)); } catch {}
           setBreakingNews(p => p?.title?.toLowerCase().trim() === normalTitle ? p : candidate);
+          if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
+            const severityLabel = candidate.severity === 'critical' ? 'CRITICAL' : 'HIGH';
+            new Notification(`⚠️ AEGIS FLASH — ${severityLabel}`, {
+              body: candidate.title,
+              tag: candidate.id,
+              icon: '/favicon.ico',
+              requireInteraction: candidate.severity === 'critical',
+            });
+          }
           return newHist;
         });
       }
