@@ -1,4 +1,4 @@
-import { fetchGDELTData, fetchGDELTGeoData, fetchRSSFeeds, fetchOpenSkyData, fetchACLEDData, fetchThinkTankAnalysis, fetchGlobalAISData, fetchTzevaAdomAlerts, fetchOSINTFeeds, fetchXFeeds, fetchSatelliteOSINT, fetchNASAFIRMS, fetchUSGSEarthquakes, fetchWeatherData, fetchReliefWebData, fetchNOTAMData, fetchIAEAData, fetchTelegramOSINT, fetchLiveuamapData, fetchCasualtyAggregates } from '@/lib/aggregator';
+import { fetchGDELTData, fetchGDELTGeoData, fetchRSSFeeds, fetchOpenSkyData, fetchACLEDData, fetchThinkTankAnalysis, fetchGlobalAISData, fetchTzevaAdomAlerts, fetchTzevaAdomHistory, fetchOSINTFeeds, fetchXFeeds, fetchSatelliteOSINT, fetchNASAFIRMS, fetchUSGSEarthquakes, fetchWeatherData, fetchReliefWebData, fetchNOTAMData, fetchIAEAData, fetchTelegramOSINT, fetchLiveuamapData, fetchCasualtyAggregates } from '@/lib/aggregator';
 import { IntelEvent } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
@@ -46,6 +46,7 @@ async function fetchFastTier(): Promise<IntelEvent[]> {
     fetchRSSFeeds(),
     fetchOpenSkyData(),
     fetchTzevaAdomAlerts(),
+    fetchTzevaAdomHistory(),
     fetchOSINTFeeds(),
     fetchXFeeds(),
     fetchTelegramOSINT(),

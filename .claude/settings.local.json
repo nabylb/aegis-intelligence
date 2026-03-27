@@ -51,7 +51,8 @@
       "Bash(curl -s \"https://hapi.humdata.org/api/v2/coordination-context/conflict-events?location_code=PSE&output_format=json&app_identifier=YWVnaXM6bmFieWxiQHppbWJsZWZ5LmNvbQ&limit=3\")",
       "Bash(curl -s \"https://hapi.humdata.org/api/v2/coordination-context/conflict-events?location_code=PSE&output_format=json&limit=3\")",
       "Bash(curl -s \"https://hapi.humdata.org/api/v2/metadata/admin1?location_code=PSE&limit=3\")",
-      "WebFetch(domain:centre.humdata.org)"
+      "WebFetch(domain:centre.humdata.org)",
+      "Bash(ipconfig getifaddr:*)"
     ]
   }
 }

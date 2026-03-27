@@ -384,11 +384,20 @@ export async function fetchACLEDData(): Promise<IntelEvent[]> {
       
       const navalMeta = classifyNavalEvent(`${e.notes} ${e.actor1} ${e.actor2}`);
       
+      // Tag actor attribution for militia/proxy groups
+      const actorStr = `${e.actor1 || ''} ${e.actor2 || ''}`.toLowerCase();
+      const isHezbollah = actorStr.includes('hezbollah') || actorStr.includes('hizballah');
+      const isHouthi = actorStr.includes('houthi') || actorStr.includes('ansar allah');
+      const isHamas = actorStr.includes('hamas') || actorStr.includes('palestinian islamic jihad');
+      const isIRGC = actorStr.includes('irgc') || actorStr.includes('revolutionary guard');
+      const actorTag = isHezbollah ? 'Hezbollah' : isHouthi ? 'Houthi' : isHamas ? 'Hamas' : isIRGC ? 'IRGC' : '';
+      const titlePrefix = actorTag ? `[${actorTag}] ` : '';
+
       events.push({
         id: `acled-${e.data_id || randomUUID()}`,
         timestamp: new Date(e.event_date).toISOString(),
-        title: `${e.sub_event_type}: ${e.actor1} → ${e.location}, ${e.country}`,
-        summary: `${e.notes} | Fatalities: ${fatalities}`,
+        title: `${titlePrefix}${e.sub_event_type}: ${e.actor1} → ${e.location}, ${e.country}`,
+        summary: `${e.notes} | Fatalities: ${fatalities}${actorTag ? ` | Actor: ${actorTag}` : ''}`,
         source: 'ACLED Conflict Data',
         type: navalMeta ? 'naval' : (isKineticStrike ? 'strike' : 'conflict'),
         severity,
@@ -1058,7 +1067,7 @@ async function fetchFromOpenSky(): Promise<IntelEvent[]> {
       const heading = s[10] ?? 0;
 
       events.push({
-        id: `flight-${icao24}-${Date.now()}`,
+        id: `flight-${icao24}`,
         timestamp: new Date().toISOString(),
         title: callsign || `ICAO ${icao24}`,
         summary: [
@@ -1324,6 +1333,110 @@ export async function fetchTzevaAdomAlerts(): Promise<IntelEvent[]> {
   }
 
   return events.length > 0 ? events : cachedTzevaEvents;
+}
+
+// ─── TZEVA ADOM HISTORY (Past 24h of attacks on Israel) ─────────────────────
+// This fetches the alerts-history endpoint which returns the last 50 alert
+// groups (each may contain multiple city alerts). This gives us a complete
+// picture of Hezbollah/Houthi/Hamas rocket barrages in the past 24 hours.
+let cachedTzevaHistory: IntelEvent[] = [];
+let lastTzevaHistoryFetch: number = 0;
+
+// Israeli city to approximate coordinates for mapping alerts
+const ISRAELI_REGIONS: Record<string, { lat: number; lng: number; region: string; source: string }> = {
+  'מטולה': { lat: 33.2778, lng: 35.5733, region: 'Upper Galilee', source: 'Hezbollah — Lebanon' },
+  'קריית שמונה': { lat: 33.2083, lng: 35.5706, region: 'Upper Galilee', source: 'Hezbollah — Lebanon' },
+  'מרגליות': { lat: 33.2244, lng: 35.5606, region: 'Upper Galilee', source: 'Hezbollah — Lebanon' },
+  'בית הלל': { lat: 33.2300, lng: 35.6100, region: 'Upper Galilee', source: 'Hezbollah — Lebanon' },
+  'מלכיה': { lat: 33.2811, lng: 35.4600, region: 'Upper Galilee', source: 'Hezbollah — Lebanon' },
+  'תל חי': { lat: 33.2350, lng: 35.5680, region: 'Upper Galilee', source: 'Hezbollah — Lebanon' },
+  'ירושלים': { lat: 31.7683, lng: 35.2137, region: 'Jerusalem', source: 'Iran / Houthi — Ballistic Missile' },
+  'תל אביב': { lat: 32.0853, lng: 34.7818, region: 'Tel Aviv', source: 'Iran / Houthi — Ballistic Missile' },
+  'חיפה': { lat: 32.7940, lng: 34.9896, region: 'Haifa', source: 'Hezbollah — Lebanon' },
+  'אשדוד': { lat: 31.8014, lng: 34.6437, region: 'Ashdod', source: 'Hamas — Gaza / Houthi' },
+  'באר שבע': { lat: 31.2530, lng: 34.7915, region: 'Beer Sheva', source: 'Hamas — Gaza' },
+  'אשקלון': { lat: 31.6653, lng: 34.5712, region: 'Ashkelon', source: 'Hamas — Gaza' },
+  'שדרות': { lat: 31.5268, lng: 34.5926, region: 'Sderot', source: 'Hamas — Gaza' },
+  'נהריה': { lat: 33.0086, lng: 35.0951, region: 'Nahariya', source: 'Hezbollah — Lebanon' },
+  'עכו': { lat: 32.9215, lng: 35.0667, region: 'Acre', source: 'Hezbollah — Lebanon' },
+  'צפת': { lat: 32.9646, lng: 35.4962, region: 'Safed', source: 'Hezbollah — Lebanon' },
+  'טבריה': { lat: 32.7922, lng: 35.5312, region: 'Tiberias', source: 'Hezbollah — Lebanon' },
+};
+
+function matchIsraeliCity(cityHe: string): { lat: number; lng: number; region: string; source: string } | null {
+  // Direct match
+  for (const [key, val] of Object.entries(ISRAELI_REGIONS)) {
+    if (cityHe.includes(key)) return val;
+  }
+  // Heuristic: northern cities → Hezbollah, southern → Hamas, central → Iran/Houthi ballistic
+  if (cityHe.includes('גליל') || cityHe.includes('גולן')) return { lat: 33.0, lng: 35.5, region: 'Northern Israel', source: 'Hezbollah — Lebanon' };
+  if (cityHe.includes('עוטף') || cityHe.includes('נגב') || cityHe.includes('שער הנגב')) return { lat: 31.4, lng: 34.5, region: 'Gaza Envelope', source: 'Hamas — Gaza' };
+  return null;
+}
+
+export async function fetchTzevaAdomHistory(): Promise<IntelEvent[]> {
+  if (Date.now() - lastTzevaHistoryFetch < 120000 && cachedTzevaHistory.length > 0) {
+    return cachedTzevaHistory;
+  }
+
+  const events: IntelEvent[] = [];
+  lastTzevaHistoryFetch = Date.now();
+
+  try {
+    const response = await fetch('https://api.tzevaadom.co.il/alerts-history', {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+      cache: 'no-store'
+    }).catch(() => null);
+
+    if (!response || !response.ok) return cachedTzevaHistory;
+    const data = await response.json().catch(() => null);
+    if (!Array.isArray(data)) return cachedTzevaHistory;
+
+    for (const group of data) {
+      const alerts = group.alerts;
+      if (!Array.isArray(alerts)) continue;
+
+      for (const alert of alerts) {
+        if (alert.isDrill) continue;
+        const time = alert.time ? new Date(alert.time * 1000) : new Date();
+        const cities = Array.isArray(alert.cities) ? alert.cities : [];
+        if (cities.length === 0) continue;
+
+        // Group alerts by region to avoid flooding the feed with per-city events
+        const firstCity = cities[0];
+        const match = matchIsraeliCity(firstCity);
+        const lat = match?.lat || 31.5;
+        const lng = match?.lng || 34.8;
+        const region = match?.region || 'Israel';
+        const attribution = match?.source || 'Unknown Origin';
+
+        // Determine severity by number of cities hit (proxy for barrage size)
+        const severity: 'low' | 'medium' | 'high' | 'critical' =
+          cities.length > 20 ? 'critical' : cities.length > 5 ? 'high' : cities.length > 1 ? 'medium' : 'low';
+
+        events.push({
+          id: `tzeva-hist-${group.id}-${alert.time}`,
+          timestamp: time.toISOString(),
+          title: `Rocket Alert: ${region} (${cities.length} areas)`,
+          summary: `${attribution}. ${cities.length} areas under alert: ${cities.slice(0, 5).join(', ')}${cities.length > 5 ? ` (+${cities.length - 5} more)` : ''}`,
+          source: 'Tzeva Adom History',
+          sourceUrl: 'https://www.tzevaadom.co.il/en/',
+          type: 'strike',
+          severity,
+          strategicScore: cities.length > 10 ? 5 : 2,
+          location: { lat, lng, name: `Alert: ${region}` },
+        });
+      }
+    }
+
+    if (events.length > 0) cachedTzevaHistory = events;
+    console.log(`[Tzeva Adom History] ${events.length} alert groups from past 24h`);
+  } catch (err) {
+    console.error('[Tzeva Adom History] Fetch failed:', err);
+  }
+
+  return events.length > 0 ? events : cachedTzevaHistory;
 }
 
 // ─── GLOBAL AEGIS SATELLITE OSINT ──────────────────────────────────────────────

@@ -984,6 +984,7 @@ export default function IntelMap({
       isSatelliteEvt: evt.type === 'satellite',
       isConflict: evt.type === 'conflict',
       isStrike: evt.type === 'strike',
+      isTzevaAdom: evt.source === 'Tzeva Adom History' || evt.source === 'Tzeva Adom (Israel Civil Defense)',
       isThermal: evt.type === 'thermal',
       isSeismic: evt.type === 'seismic',
       isWeather: evt.type === 'weather',
@@ -1174,7 +1175,7 @@ export default function IntelMap({
           );
         })}
 
-        {locatableEventsWithFlags.map(({ evt, isAviation, isNaval, isSatelliteEvt, isConflict, isStrike, isThermal, isSeismic, isWeather, isHumanitarian, isNOTAM, isNuclear, hasCasualties, isHighSeverity }, idx) => {
+        {locatableEventsWithFlags.map(({ evt, isAviation, isNaval, isSatelliteEvt, isConflict, isStrike, isTzevaAdom, isThermal, isSeismic, isWeather, isHumanitarian, isNOTAM, isNuclear, hasCasualties, isHighSeverity }, idx) => {
           return (
             <Marker key={`${evt.id}-${idx}`} longitude={evt.location!.lng} latitude={evt.location!.lat} anchor="center">
               <div
@@ -1201,6 +1202,8 @@ export default function IntelMap({
                       ? `w-4 h-4 border-indigo-500/50 text-indigo-400 ${isHighSeverity ? 'bg-indigo-500/40 shadow-[0_0_12px_rgba(99,102,241,0.6)]' : 'bg-indigo-500/20'}`
                       : isNuclear
                       ? `w-5 h-5 border-fuchsia-500/50 text-fuchsia-400 ${isHighSeverity ? 'bg-fuchsia-500/40 shadow-[0_0_15px_rgba(217,70,239,0.6)] animate-pulse' : 'bg-fuchsia-500/20'}`
+                      : isTzevaAdom
+                      ? 'w-5 h-5 bg-red-600/60 border-red-500 text-red-200 shadow-[0_0_20px_rgba(239,68,68,0.8)] animate-pulse'
                       : (isConflict || isStrike)
                         ? hasCasualties ? 'bg-red-600 border-red-400 text-white font-black shadow-[0_0_15px_rgba(220,38,38,0.8)] scale-125' : 'bg-orange-500/40 border-orange-500/80 text-orange-400'
                         : isHighSeverity
@@ -1229,6 +1232,11 @@ export default function IntelMap({
                     <ShieldOff className="w-3 h-3" />
                   ) : isNuclear ? (
                     <Radiation className="w-3.5 h-3.5" />
+                  ) : isTzevaAdom ? (
+                    <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M12 2L12 6"/><path d="M12 18L12 22"/><path d="M4.93 4.93L7.76 7.76"/><path d="M16.24 16.24L19.07 19.07"/>
+                      <path d="M2 12H6"/><path d="M18 12H22"/><circle cx="12" cy="12" r="4" fill="currentColor" opacity="0.5"/>
+                    </svg>
                   ) : (isConflict || isStrike) && hasCasualties ? (
                      <span className="text-[12px]">{evt.fatalities}</span>
                   ) : isStrike ? (

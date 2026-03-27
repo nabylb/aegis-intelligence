@@ -277,8 +277,14 @@ export default function IntelDashboard() {
     severity === 'high' ? 'bg-orange-500' :
     'bg-neutral-500';
 
+  // CSS vars needed by the nav (outside the root div) — mirrors the root div's inline styles
+  const cssVars = nightMode
+    ? { '--panel-bg': 'rgba(20,0,0,0.7)', '--panel-border': 'rgba(127,29,29,0.2)', '--panel-text': 'rgba(252,165,165,0.8)', '--panel-muted': 'rgba(127,29,29,0.5)', '--header-bg': 'rgba(10,0,0,0.8)' } as React.CSSProperties
+    : { '--panel-bg': 'rgba(0,0,0,0.6)', '--panel-border': 'rgba(255,255,255,0.08)', '--panel-text': 'rgba(212,212,216,1)', '--panel-muted': 'rgba(115,115,115,1)', '--header-bg': 'rgba(10,10,10,0.6)' } as React.CSSProperties;
+
   return (
-    <div className={`relative w-screen h-screen overflow-hidden font-mono selection:bg-neutral-800 ${nightMode ? 'aegis-night bg-black text-red-300/80' : 'bg-neutral-950 text-neutral-300'}`} style={nightMode ? { '--panel-bg': 'rgba(20,0,0,0.7)', '--panel-border': 'rgba(127,29,29,0.2)', '--panel-text': 'rgba(252,165,165,0.8)', '--panel-muted': 'rgba(127,29,29,0.5)', '--header-bg': 'rgba(10,0,0,0.8)' } as React.CSSProperties : { '--panel-bg': 'rgba(0,0,0,0.6)', '--panel-border': 'rgba(255,255,255,0.08)', '--panel-text': 'rgba(212,212,216,1)', '--panel-muted': 'rgba(115,115,115,1)', '--header-bg': 'rgba(10,10,10,0.6)' } as React.CSSProperties}>
+    <>
+    <div className={`relative w-screen h-dvh overflow-hidden font-mono selection:bg-neutral-800 ${nightMode ? 'aegis-night bg-black text-red-300/80' : 'bg-neutral-950 text-neutral-300'}`} style={cssVars}>
 
       {/* Loading Overlay — shown on first load before any data arrives */}
       {isInitialLoad && events.length === 0 && (
@@ -1012,8 +1018,13 @@ export default function IntelDashboard() {
         </div>
       )}
 
+    </div>
+
       {/* ─── MOBILE: Bottom Tab Navigation ──────────────────────────────────── */}
-      <nav className="md:hidden absolute bottom-0 left-0 right-0 h-14 z-30 flex items-stretch backdrop-blur-xl border-t safe-bottom" style={{ background: 'var(--header-bg)', borderColor: 'var(--panel-border)' }}>
+      {/* NOTE: Rendered OUTSIDE the overflow-hidden root div to prevent GPU compositing
+          clipping on Android Chrome. MapLibre's WebGL canvas promotes the root div to a
+          compositing layer, which causes overflow:hidden to clip position:fixed children. */}
+      <nav className="md:hidden fixed bottom-0 left-0 right-0 h-14 z-30 flex items-stretch backdrop-blur-xl border-t safe-bottom" style={{ background: 'var(--header-bg)', borderColor: 'var(--panel-border)', ...cssVars }}>
         {([
           { key: 'map' as const, label: 'MAP', icon: <MapIcon className="w-4 h-4" /> },
           { key: 'sigint' as const, label: 'SIGINT', icon: <RadioTower className="w-4 h-4" />, badge: sigintFeedEvents.length },
@@ -1034,8 +1045,7 @@ export default function IntelDashboard() {
           </button>
         ))}
       </nav>
-
-    </div>
+    </>
   );
 }
 
